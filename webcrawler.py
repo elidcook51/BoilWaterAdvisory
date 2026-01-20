@@ -1,27 +1,35 @@
-from google.cloud import bigquery
-from google.oauth2 import service_account
 import pandas as pd
-import sqlite3
-import os
-import pyarrow
-import re
-import requests
-from bs4 import BeautifulSoup
 from scrapy.crawler import CrawlerProcess
 from boil_crawler import BoilAdvisorySpider
+from dateChecker import estimate_publication_date
+from multiprocessing import Process
 
-newsPaperDf = pd.read_csv('better_newspapers_by_state.csv')
-SEEDS = newsPaperDf['newspaper_url'].tolist()
 
-def run_in_batches(seeds, batch_size = 40):
+
+def run_batch(batch):
+    process = CrawlerProcess()
+    for seed in batch:
+        process.crawl(BoilAdvisorySpider, start_url = seed)
+    process.start()
+
+def run_in_batches(seeds, batch_size):
     for i in range(0, len(seeds), batch_size):
         batch = seeds[i:i+batch_size]
-        process = CrawlerProcess()
-        for seed in batch:
-            process.crawl(BoilAdvisorySpider, start_url = seed)
-        process.start()
+        p = Process(target = run_batch, args = (batch,))
+        p.start()
+        p.join()
+        print(f'********************* \n\n\n\n\n BATCH {i / batch_size} COMPLETED\n\n\n\n\n\n\n\n **********************')
 
-run_in_batches(SEEDS, batch_size = 40)
+if __name__ == '__main__':
+    newsPaperDf = pd.read_csv('better_newspapers_by_state.csv')
+    SEEDS = newsPaperDf['newspaper_url'].tolist()
+    run_in_batches(SEEDS, batch_size = 2)
+
+# gottenLinks = pd.read_csv('boil_links.csv')
+# gottenLinks = gottenLinks['url'].tolist()
+# for url in gottenLinks:
+#     datePub = estimate_publication_date(url)
+#     print(f"For url {url}, estimated publish date of {datePub['estimated_publication_date']} with confidence {datePub['confidence_score']}")
 
 
 # projID = 'awesome-sphere-477404-v5'

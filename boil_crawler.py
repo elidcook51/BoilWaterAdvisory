@@ -29,7 +29,7 @@ class BoilAdvisorySpider(scrapy.Spider):
     "AUTOTHROTTLE_ENABLED": True,
     "AUTOTHROTTLE_START_DELAY": 0.5,
     "AUTOTHROTTLE_MAX_DELAY": 5.0,
-    "DEPTH_LIMIT": 4,
+    "DEPTH_LIMIT": 5,
     "CONCURRENT_REQUESTS": 8,
 
     "FEEDS": {
@@ -46,6 +46,7 @@ class BoilAdvisorySpider(scrapy.Spider):
         super().__init__(*args,**kwargs)
         self.start_url = start_url
         self.seed_domain = urlparse(start_url).hostname
+        self.seen_urls = set()
 
     def start_requests(self):
         yield scrapy.Request(self.start_url, callback = self.parse)
@@ -53,6 +54,7 @@ class BoilAdvisorySpider(scrapy.Spider):
     def parse(self, response):
         title = (response.css('title::text').get() or "").strip()
         url = response.url
+        self.seen_ruls.add(url)
         body_text = " ".join(response.css('p::text').getall())
 
         match = ROBUST_RE.search(title) or ROBUST_RE.search(url) or ROBUST_RE.search(body_text)
@@ -76,6 +78,7 @@ class BoilAdvisorySpider(scrapy.Spider):
             host = (urlparse(target).hostname or "")
             host_reg = host.split('.')[-2:]
             if seed_reg and host_reg == seed_reg:
-                yield scrapy.Request(target, callback = self.parse)
+                if target not in self.seen_urls:
+                    yield scrapy.Request(target, callback = self.parse)
 
     
