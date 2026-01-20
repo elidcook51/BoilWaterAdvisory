@@ -8,7 +8,6 @@ import os
 import shutil
 
 abbreviation_to_name = {
-    # https://en.wikipedia.org/wiki/List_of_states_and_territories_of_the_United_States#States.
     "AK": "Alaska",
     "AL": "Alabama",
     "AR": "Arkansas",
@@ -59,9 +58,7 @@ abbreviation_to_name = {
     "WI": "Wisconsin",
     "WV": "West Virginia",
     "WY": "Wyoming",
-    # https://en.wikipedia.org/wiki/List_of_states_and_territories_of_the_United_States#Federal_district.
     "DC": "District of Columbia",
-    # https://en.wikipedia.org/wiki/List_of_states_and_territories_of_the_United_States#Inhabited_territories.
     "AS": "American Samoa",
     "GU": "Guam GU",
     "MP": "Northern Mariana Islands",
