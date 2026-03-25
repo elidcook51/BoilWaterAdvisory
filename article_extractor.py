@@ -1,186 +1,150 @@
 import requests
 from bs4 import BeautifulSoup
-import json
-import trafilatura
-import re
-from readability import Document
-import html2text
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
-from webdriver_manager.chrome import ChromeDriverManager
+import pandas as pd
+import os
+import ast
+from dotenv import load_dotenv
+from playwright.sync_api import sync_playwright
 import time
+import random
+from copy import deepcopy
+import textwrap
 
+load_dotenv()
 
-def fetch_html(url):
-    header = {
-        "User-Agent": 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
-    }
-    try:
-        response = requests.get(url, headers = header, timeout = 10)
-        response.raise_for_status()
-        return response.text
-    except requests.exceptions.RequestException as e:
-        print(f"Error fetching URL {url}: {e}")
-        return fetch_with_headless_browser(url)
+testLinksPath = "C:/Users/ucg8nb/Downloads/Boil_Water_Truth_v0.csv"
 
-def fetch_with_headless_browser(url, wait_time = 10):
-    options = Options()
-    options.add_argument('--headless')
-    options.add_argument('--disable-gpu')
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("user-agent=Mozilla/5.0")
+testDf = pd.read_csv(testLinksPath)
 
-    try:
-        service = Service(ChromeDriverManager().install())
-        driver = webdriver.Chrome(service=service, options = options)
-        driver.get(url)
-        driver.set_page_load_timeout(wait_time)
-        html = driver.page_source
-        driver.quit()
-        print(f"Headless browser success for {url}")
+HEADERS = ast.literal_eval(os.getenv('HEADERS'))
+
+KEYWORDS = ['boil water', 'boil advisory', 'water advisory', 'precautionary boil', 'do not drink', 'issued', 'water system', 'public water supply', 'lifted', 'rescinded', 'effective', 'until further notice', 'posted', 'post', 'emergency', 'planned', 'boil-water', 'boil', 'water', 'pressure loss', 'bottled water']
+WINDOW = 3
+
+def is_valid_html(html):
+    if not html or len(html) < 500:
+        return False
+    invalid_signals = ['enable javascript', 'access denied', 'captcha', 'checking your browser', 'cloudflare']
+
+    lowered = html.lower()
+    return not any(signal in lowered for signal in invalid_signals)
+
+def render_html_playwright(url):
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless = True, args = ['--disable-blink-features=AutomationControlled'])
+        context = browser.new_context(
+            user_agent = HEADERS['User-Agent'],
+            locale = 'en-US',
+            viewport = {'width':1366, 'height':768}
+        )
+        page = context.new_page()
+        page.goto(url, wait_until='domcontentloaded')
+        time.sleep(random.uniform(0.5, 1.5))
+        html = page.content()
+        context.close()
+        browser.close()
         return html
-    except Exception as e:
-        print(f"Headless browser failed for {url}: {e}")
-        return None
-
-def extract_from_jsonld(html: str) -> dict | None:
-    soup = BeautifulSoup(html, "lxml")
-    for tag in soup.find_all("script", type="application/ld+json"):
-        # Some sites pack multiple JSON objects/arrays in one script tag
-        try:
-            data = json.loads(tag.string or "{}")
-        except json.JSONDecodeError:
-            continue
-
-        candidates = data if isinstance(data, list) else [data]
-        for obj in candidates:
-            t = obj.get("@type", "")
-            if isinstance(t, list):
-                is_article = any(x in ("NewsArticle", "Article", "ReportageNewsArticle") for x in t)
-            else:
-                is_article = t in ("NewsArticle", "Article", "ReportageNewsArticle")
-
-            if is_article:
-                out = {
-                    "title": obj.get("headline") or obj.get("name"),
-                    "author": None,
-                    "date": obj.get("datePublished") or obj.get("dateCreated"),
-                    "description": obj.get("description"),
-                    "articleBody": obj.get("articleBody"),
-                    "publisher": (obj.get("publisher") or {}).get("name")
-                                 if isinstance(obj.get("publisher"), dict) else obj.get("publisher"),
-                    "url": obj.get("url"),
-                }
-                # Normalize author(s)
-                author = obj.get("author")
-                if isinstance(author, list):
-                    out["author"] = ", ".join(
-                        [a.get("name") if isinstance(a, dict) else str(a) for a in author]
-                    )
-                elif isinstance(author, dict):
-                    out["author"] = author.get("name")
-                elif author:
-                    out["author"] = str(author)
-
-                # If articleBody is present, this is ideal.
-                if out.get("articleBody"):
-                    return out
-                # If articleBody missing, keep metadata; we'll fill body via other extractors
-                return out
-    return None
-
-def extract_main_text(html: str) -> str | None:
-    # 3a) Trafilatura (very strong on news)
-    downloaded = trafilatura.extract(html, output_format="txt", include_images=False, include_tables=False,
-                                     favor_recall=False, with_metadata=False)
-    if downloaded and len(downloaded.strip()) > 200:  # heuristic
-        return downloaded.strip()
-
-    # 3b) Readability
+    
+def render_html_complete(url):
     try:
-        doc = Document(html)
-        article_html = doc.summary(html_partial=True)
-        soup = BeautifulSoup(article_html, "lxml")
-        for tag in soup(["script", "style", "noscript", "form", "footer", "nav", "aside"]):
-            tag.decompose()
-        text = soup.get_text(separator= '\n', strip = True)
-        text = re.sub(r"\n{2,}", "\n\n", text).strip()
-        if len(text) > 200:
-            return text
+        response = requests.get(url, headers = HEADERS)
+
+        if response.status_code == 200:
+            html = response.text
+            if is_valid_html(html):
+                return html
+    except requests.RequestException:
+        pass
+
+    try:
+        html = render_html_playwright(url)
+        if is_valid_html(html):
+            return html
     except Exception:
         pass
 
-    # 3c) Very simple density fallback
-    soup = BeautifulSoup(html, "lxml")
-    for t in soup(["script", "style", "noscript", "form"]):
-        t.decompose()
-
-    best_node, best_score = None, 0
-    for node in soup.find_all(["article", "section", "div", "main"]):
-        text = node.get_text(separator= '\n', strip = True)
-        link_count = len(node.find_all("a")) + 1
-        score = len(text) / link_count  # crude text/link density
-        if score > best_score and len(text) > 200:
-            best_score, best_node = score, node
-    if best_node:
-        text = best_node.get_text(separator= '\n', strip = True)
-        text = re.sub(r"\n{2,}", "\n\n", text)
-        return text.strip()
     return None
 
-def html_to_markdown(html: str) -> str:
-    h = html2text.HTML2Text()
-    h.ignore_links = False  # keep URLs if helpful
-    h.ignore_images = True
-    h.body_width = 0  # no wrapping
-    md = h.handle(html)
-    return "\n".join(line.rstrip() for line in md.splitlines()).strip()
 
 
-def extract_article(url: str) -> dict:
-    html = fetch_html(url)
+def reduce_html(response_text):
+    soup = BeautifulSoup(response_text, 'html.parser')
 
-    if not html:
-        print(f"Skipping URL due to empty or failed fetch: {url}")
-        return {
-            "title": None,
-            "author": None,
-            "date": None,
-            "publisher": None,
-            "url": url,
-            "description": None,
-            'text': None,
+    for tag in soup(['script', 'style', 'noscript', 'svg']):
+        tag.decompose()
+    for cls in ['header', 'footer', 'nav', 'menu', 'cookie', 'breadcrumbs']:
+        for el in soup.select(f".{cls}"):
+            el.decompose()
+
+    paragraphs = soup.get_text('\n').split("\n")
+    keep = set()
+
+    for i, p in enumerate(paragraphs):
+        if any(k in p.lower() for k in KEYWORDS):
+            for j in range(max(0, i - WINDOW), min(len(paragraphs), i + WINDOW + 1)):
+                keep.add(j)
+    trimmed_text = '\n'.join(paragraphs[i] for i in sorted(keep))
+    return trimmed_text
+
+testDataPath = "C:/Users/ucg8nb/Downloads/GDELT news data.csv"
+
+gdeltDf = pd.read_csv(testDataPath)
+
+virginiaData = gdeltDf[gdeltDf['location_fullname'].str.contains('virginia', case = False)]
+
+outputDf = pd.DataFrame()
+totalLen = len(virginiaData)
+count = 0
+for _, row in virginiaData.iterrows():
+    html = render_html_complete(row['link'])
+    if html is None:
+        newRow = {
+            'Link': row['link'],
+            'Loaded': False,
+            'Text': ''
         }
+    else:
+        reduced_text = reduce_html(html)
+        newRow = {
+            'Link': row['link'],
+            'Loaded': True,
+            'Text': reduced_text
+        }
+    outputDf = outputDf._append(newRow, ignore_index = True)
+    count += 1
+    print(f"Completed Entry {count}: {count * 100 / totalLen:.2f}% ({count}/{totalLen}) of the way")
 
-    
-    meta = extract_from_jsonld(html) or {}
-    body = meta.get("articleBody")
+outputDf.to_csv("C:/Users/ucg8nb/Downloads/Virginia News Text.csv")
 
-    if not body:
-        body = extract_main_text(html)
+# for _, row in testDf.iterrows():
+#     fullLength = len(row['Request Text'])
+#     reductionLength = len(str(row['Big Trim']))
+#     print(f"Initial Size {fullLength}, reduced size {reductionLength}, percentage of length {reductionLength/fullLength}")
 
-    # If we still somehow have only HTML (from readability), ensure plaintext:
-    if body and ("<" in body and ">" in body and "</" in body):
-        body = BeautifulSoup(body, "lxml").get_text(separator = '\n', strip = True)
+# firstPerc = []
+# bigTrimPerc = []
 
-    # Fallback: convert whole HTML to markdown if everything else fails
-    if not body:
-        body = html_to_markdown(html)
+# for _, row in testDf.iterrows():
+#     fullLength = len(row['Request Text'])
+#     initalReduction = len(row['First Trim'])
+#     bigReduction = len(str(row['Big Trim']))
+#     firstPerc.append(initalReduction / fullLength)
+#     bigTrimPerc.append(bigReduction / fullLength)
 
-    # Collapse whitespace
-    body = "\n".join(chunk.strip() for chunk in body.splitlines() if chunk.strip())
+# testDf['FirstPerc'] = firstPerc
+# testDf['BigTrimPerc'] = bigTrimPerc
 
-    return {
-        "title": meta.get("title"),
-        "author": meta.get("author"),
-        "date": meta.get("date"),
-        "publisher": meta.get("publisher"),
-        "url": meta.get("url") or url,
-        "description": meta.get("description"),
-        "text": body,
-    }
+# firstTrims = []
+# bigTrims = []
 
+# for _, row in testDf.iterrows():
+#     firstTrim, bigTrim = reduce_html(row['Request Text'])
+#     firstTrims.append(firstTrim)
+#     print(bigTrim.replace('\n', ""))
+#     bigTrims.append(bigTrim)
 
+# testDf['First Trim'] = firstTrims
+# testDf['Big Trim'] = bigTrims
 
+# testDf.to_csv(testLinksPath, index = False)
+# print(testDf[['Playwright Text', 'Request Text']])

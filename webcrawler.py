@@ -1,10 +1,19 @@
 import pandas as pd
+import importlib
 from scrapy.crawler import CrawlerProcess
+from scrapy.settings import Settings
 from boil_crawler import BoilAdvisorySpider
 from dateChecker import estimate_publication_date
 from multiprocessing import Process
 
+# newsPaperDf = pd.read_csv('better_newspapers_by_state.csv')
+# newsPaperDf['scraped'] = False
+# newsPaperDf.to_csv('better_newspapers_by_state.csv')
 
+# kentuckyList = pd.read_csv('KentuckyCountyList.csv')
+# kentuckyList['scraped'] = False
+# kentuckyList = kentuckyList.loc[:, ~df.columns.str.contains('Unnamed')]
+# kentuckyList.to_csv('KentuckyCountyList.csv')
 
 def run_batch(batch):
     process = CrawlerProcess()
@@ -18,12 +27,19 @@ def run_in_batches(seeds, batch_size):
         p = Process(target = run_batch, args = (batch,))
         p.start()
         p.join()
-        print(f'********************* \n\n\n\n\n BATCH {i / batch_size} COMPLETED\n\n\n\n\n\n\n\n **********************')
+        print(f'********************* \n\n\n\n ELEMENT {i} COMPLETED\n\n\n\n **********************')
+        for b in batch:
+            newsPaperDf.loc[newsPaperDf['newspaper_url'] == b, 'scraped'] = True
+            newsPaperDf.to_csv('better_newspaper_by_state.csv')
 
 if __name__ == '__main__':
     newsPaperDf = pd.read_csv('better_newspapers_by_state.csv')
-    SEEDS = newsPaperDf['newspaper_url'].tolist()
-    run_in_batches(SEEDS, batch_size = 2)
+    kentuckyDf = newsPaperDf[newsPaperDf['state'] == 'Kentucky']
+    SEEDS = kentuckyDf[kentuckyDf['scraped'] == False]['newspaper_url'].tolist()
+
+    # kentuckyList = pd.read_csv('KentuckyCountyList.csv')
+    # SEEDS = kentuckyList[kentuckyList['scraped'] == False]['Homepage'].tolist()
+    run_in_batches(SEEDS, batch_size = 1)
 
 # gottenLinks = pd.read_csv('boil_links.csv')
 # gottenLinks = gottenLinks['url'].tolist()
