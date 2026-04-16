@@ -12,6 +12,7 @@ import textwrap
 import matplotlib.pyplot as plt
 import numpy as np
 import re
+from rapidfuzz import fuzz, process
 
 load_dotenv()
 
@@ -108,6 +109,8 @@ testDataPath = "C:/Users/ucg8nb/Downloads/GDELT news data.csv"
 gdeltDf = pd.read_csv(testDataPath)
 
 virginiaData = gdeltDf[gdeltDf['location_fullname'].str.contains('virginia', case = False)]
+
+print(len(virginiaData))
 
 outputDf = pd.DataFrame()
 totalLen = len(virginiaData)
