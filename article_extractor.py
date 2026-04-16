@@ -9,6 +9,9 @@ import time
 import random
 from copy import deepcopy
 import textwrap
+import matplotlib.pyplot as plt
+import numpy as np
+import re
 
 load_dotenv()
 
@@ -18,8 +21,19 @@ testDf = pd.read_csv(testLinksPath)
 
 HEADERS = ast.literal_eval(os.getenv('HEADERS'))
 
-KEYWORDS = ['boil water', 'boil advisory', 'water advisory', 'precautionary boil', 'do not drink', 'issued', 'water system', 'public water supply', 'lifted', 'rescinded', 'effective', 'until further notice', 'posted', 'post', 'emergency', 'planned', 'boil-water', 'boil', 'water', 'pressure loss', 'bottled water']
-WINDOW = 3
+KEYWORDS = ['boil water', 'boil advisory', 'water advisory', 'precautionary boil', 'do not drink', 'issued', 'water system', 'public water supply', 'lifted', 'rescinded', 'effective', 'until further notice', 'posted', 'post', 'emergency', 'planned', 'boil-water', 'boil', 'water', 'pressure loss', 'bottled water', 'effective', 'issued', 'updated', 'until further notice', 'lifted on', 'in effect', 'as of', 'starting', 'ending']
+    
+DATE_REGEX = re.compile(
+    r'\b('
+    r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|'          # 3/5/2024, 03-05-24
+    r'\d{4}[/-]\d{1,2}[/-]\d{1,2}|'            # 2024-03-05
+    r'(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2},?\s+\d{4}|' 
+    r'\d{1,2}\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{4}'
+    r')\b',
+    re.IGNORECASE
+)
+
+WINDOW = 4
 
 def is_valid_html(html):
     if not html or len(html) < 500:
@@ -68,21 +82,24 @@ def render_html_complete(url):
 
 
 def reduce_html(response_text):
-    soup = BeautifulSoup(response_text, 'html.parser')
+    if 'html' not in response_text:
+        return ""
 
-    for tag in soup(['script', 'style', 'noscript', 'svg']):
-        tag.decompose()
-    for cls in ['header', 'footer', 'nav', 'menu', 'cookie', 'breadcrumbs']:
-        for el in soup.select(f".{cls}"):
-            el.decompose()
+    soup = BeautifulSoup(response_text, 'html.parser')
 
     paragraphs = soup.get_text('\n').split("\n")
     keep = set()
 
     for i, p in enumerate(paragraphs):
-        if any(k in p.lower() for k in KEYWORDS):
+        text = p.lower()
+
+        keyword_match = any(k in text for k in KEYWORDS)
+        date_match = DATE_REGEX.search(p) is not None
+
+        if keyword_match or date_match:
             for j in range(max(0, i - WINDOW), min(len(paragraphs), i + WINDOW + 1)):
                 keep.add(j)
+
     trimmed_text = '\n'.join(paragraphs[i] for i in sorted(keep))
     return trimmed_text
 
@@ -115,36 +132,3 @@ for _, row in virginiaData.iterrows():
     print(f"Completed Entry {count}: {count * 100 / totalLen:.2f}% ({count}/{totalLen}) of the way")
 
 outputDf.to_csv("C:/Users/ucg8nb/Downloads/Virginia News Text.csv")
-
-# for _, row in testDf.iterrows():
-#     fullLength = len(row['Request Text'])
-#     reductionLength = len(str(row['Big Trim']))
-#     print(f"Initial Size {fullLength}, reduced size {reductionLength}, percentage of length {reductionLength/fullLength}")
-
-# firstPerc = []
-# bigTrimPerc = []
-
-# for _, row in testDf.iterrows():
-#     fullLength = len(row['Request Text'])
-#     initalReduction = len(row['First Trim'])
-#     bigReduction = len(str(row['Big Trim']))
-#     firstPerc.append(initalReduction / fullLength)
-#     bigTrimPerc.append(bigReduction / fullLength)
-
-# testDf['FirstPerc'] = firstPerc
-# testDf['BigTrimPerc'] = bigTrimPerc
-
-# firstTrims = []
-# bigTrims = []
-
-# for _, row in testDf.iterrows():
-#     firstTrim, bigTrim = reduce_html(row['Request Text'])
-#     firstTrims.append(firstTrim)
-#     print(bigTrim.replace('\n', ""))
-#     bigTrims.append(bigTrim)
-
-# testDf['First Trim'] = firstTrims
-# testDf['Big Trim'] = bigTrims
-
-# testDf.to_csv(testLinksPath, index = False)
-# print(testDf[['Playwright Text', 'Request Text']])
