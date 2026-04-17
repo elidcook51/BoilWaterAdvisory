@@ -13,6 +13,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import re
 from rapidfuzz import fuzz, process
+from pathlib import Path
+from urllib.parse import urlparse
 
 load_dotenv()
 
@@ -68,7 +70,7 @@ def render_html_complete(url):
             html = response.text
             if is_valid_html(html):
                 return html
-    except requests.RequestException:
+    except Exception:
         pass
 
     try:
@@ -104,34 +106,122 @@ def reduce_html(response_text):
     trimmed_text = '\n'.join(paragraphs[i] for i in sorted(keep))
     return trimmed_text
 
-testDataPath = "C:/Users/ucg8nb/Downloads/GDELT news data.csv"
+def combine_df_with_csv(df, csvPath):
+    csvPath = Path(csvPath)
 
-gdeltDf = pd.read_csv(testDataPath)
-
-virginiaData = gdeltDf[gdeltDf['location_fullname'].str.contains('virginia', case = False)]
-
-print(len(virginiaData))
-
-outputDf = pd.DataFrame()
-totalLen = len(virginiaData)
-count = 0
-for _, row in virginiaData.iterrows():
-    html = render_html_complete(row['link'])
-    if html is None:
-        newRow = {
-            'Link': row['link'],
-            'Loaded': False,
-            'Text': ''
-        }
+    if csvPath.exists():
+        existingDf = pd.read_csv(csvPath)
+        combinedDf = pd.concat([existingDf, df], ignore_index = True)
     else:
-        reduced_text = reduce_html(html)
-        newRow = {
-            'Link': row['link'],
-            'Loaded': True,
-            'Text': reduced_text
-        }
-    outputDf = outputDf._append(newRow, ignore_index = True)
-    count += 1
-    print(f"Completed Entry {count}: {count * 100 / totalLen:.2f}% ({count}/{totalLen}) of the way")
+        combinedDf = df.copy()
+    
+    combinedDf.to_csv(csvPath, index = False)
 
-outputDf.to_csv("C:/Users/ucg8nb/Downloads/Virginia News Text.csv")
+def clean_and_validate(url):
+    if not isinstance(url, str):
+        return None
+    
+    url = url.strip()
+
+    if not url:
+        return None
+    
+    if url.startswith('www.'):
+        url = 'https://' + url
+
+    if not url.startswith(('http://', 'https://')):
+        return None
+    
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme in ('http', 'https') and parsed.netloc:
+            return url
+    except Exception:
+        pass
+
+    return None
+
+def get_all_news_text_batched(startPath, endPath, batchSize = 100):
+    df = pd.read_csv(startPath)
+    endDf = pd.read_csv(endPath)
+
+    seenURLs = set(endDf['Link'])
+
+    batchStart = 0
+
+    totalLen = len(df)
+    count = 0
+    batchCount = 0
+
+    while batchStart < len(df):
+        batchEnd = batchStart + batchSize
+        batch = df.iloc[batchStart: batchEnd]
+
+        outputDf = pd.DataFrame()
+
+        for _, row in batch.iterrows():
+            cleaned_url = clean_and_validate(row['link'])
+
+            if cleaned_url is None or cleaned_url in seenURLs:
+                count += 1
+                continue
+
+            html = render_html_complete(cleaned_url)
+            if html is None:
+                newRow = {
+                    'Link': cleaned_url,
+                    'Loaded': False,
+                    'Text': ''
+                }
+            else:
+                reduced_text = reduce_html(html)
+                newRow = {
+                    'Link': cleaned_url,
+                    'Loaded': True,
+                    'Text': reduced_text
+                }
+
+            outputDf = outputDf._append(newRow, ignore_index = True)
+            count += 1
+            print(f"Completed Entry {count}: {count * 100 / totalLen:.2f}% ({count}/{totalLen}) of the way")
+
+        combine_df_with_csv(outputDf, endPath)
+
+        batchCount += 1
+        print(f"{'#' * 20} {'\n' * 5} BATCH NUMBER {batchCount} Completed {'\n' * 5} {'#' * 20}")
+
+        batchStart = batchEnd
+
+
+cleanGDELT = "C:/Users/ucg8nb/Downloads/Clean GDELT.csv"
+newsText = "C:/Users/ucg8nb/Downloads/Entire News Text.csv"
+
+get_all_news_text_batched(cleanGDELT, newsText, batchSize = 100)
+
+# gdeltDf = pd.read_csv(cleanGDELT)
+
+# virginiaData = gdeltDf[gdeltDf['location_fullname'].str.contains('virginia', case = False)]
+
+# outputDf = pd.DataFrame()
+# totalLen = len(virginiaData)
+# count = 0
+# for _, row in virginiaData.iterrows():
+#     html = render_html_complete(row['link'])
+#     if html is None:
+#         newRow = {
+#             'Link': row['link'],
+#             'Loaded': False,
+#             'Text': ''
+#         }
+#     else:
+#         reduced_text = reduce_html(html)
+#         newRow = {
+#             'Link': row['link'],
+#             'Loaded': True,
+#             'Text': reduced_text
+#         }
+#     outputDf = outputDf._append(newRow, ignore_index = True)
+#     count += 1
+#     print(f"Completed Entry {count}: {count * 100 / totalLen:.2f}% ({count}/{totalLen}) of the way")
+
+# outputDf.to_csv("C:/Users/ucg8nb/Downloads/Entire News Text.csv")
