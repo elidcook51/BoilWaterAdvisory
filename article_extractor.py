@@ -64,7 +64,7 @@ def render_html_playwright(url):
     
 def render_html_complete(url):
     try:
-        response = requests.get(url, headers = HEADERS)
+        response = requests.get(url, headers = HEADERS, timeout=30)
 
         if response.status_code == 200:
             html = response.text
@@ -143,7 +143,10 @@ def clean_and_validate(url):
 
 def get_all_news_text_batched(startPath, endPath, batchSize = 100):
     df = pd.read_csv(startPath)
-    endDf = pd.read_csv(endPath)
+    if os.path.exists(endPath):
+        endDf = pd.read_csv(endPath)
+    else:
+        endDf = pd.DataFrame(columns = ['Link', 'Loaded', 'Text'])
 
     seenURLs = set(endDf['Link'])
 
@@ -193,8 +196,8 @@ def get_all_news_text_batched(startPath, endPath, batchSize = 100):
         batchStart = batchEnd
 
 
-cleanGDELT = "C:/Users/ucg8nb/Downloads/Clean GDELT.csv"
-newsText = "C:/Users/ucg8nb/Downloads/Entire News Text.csv"
+cleanGDELT = "C:/Users/ucg8nb/Downloads/Cleaned Canada GDELT.csv"
+newsText = "C:/Users/ucg8nb/Downloads/Canada News Text.csv"
 
 get_all_news_text_batched(cleanGDELT, newsText, batchSize = 100)
 

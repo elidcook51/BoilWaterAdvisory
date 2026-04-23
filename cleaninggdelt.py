@@ -56,7 +56,7 @@ DATE_PATTERNS = [
 ]
 
 
-def buildSimilarDf(wholeDf):
+def build_similiar_df(wholeDf):
     links = wholeDf['link'].dropna().tolist()
     pairs = []
     for i, s1 in enumerate(links):
@@ -125,7 +125,7 @@ def split_groups_by_date(groups):
 def link_works(url):
     print(f"Checking Link {url}")
     try:
-        r = requests.get(url, headers = HEADERS)
+        r = requests.get(url, headers = HEADERS, timeout = 30)
 
         if r.status_code != 200:
             return False
@@ -166,61 +166,53 @@ def get_all_good_links(groups):
         print(f"Finished group {count}/{totLen} ({count / totLen * 100:.2f}%)")
     return cannoncial_links
 
-fullGdeltPath = "C:/Users/ucg8nb/Downloads/GDELT news data.csv"
+def full_clean_GDELT(GDELT_path, output_path, pickle_path = 'bad_links'):
+    gdeltDf = pd.read_csv(GDELT_path)
+    all_links = set(gdeltDf['link'])
 
-with open('full_bad_links.pkl', 'rb') as f:
-    bad_link = pickle.load(f)
+    print("Removing links which don't contain advisories")
+    tempDf = gdeltDf.copy()
 
-fullGDELT = pd.read_csv(fullGdeltPath)
+    for keyword in ADVISORY_WORDS:
+        tempDf = tempDf[~tempDf['link'].str.contains(keyword, case = False)]
 
-cleanGDELT = fullGDELT[~fullGDELT['link'].isin(bad_link)]
+    bad_links = set(tempDf['link'])
 
-# similarDfPath = 'C:/Users/ucg8nb/Downloads/Similar Df.csv'
-cleanedGdeltPath = "C:/Users/ucg8nb/Downloads/Clean GDELT.csv"
+    links_to_keep = all_links - bad_links
 
-cleanGDELT.to_csv(cleanedGdeltPath)
+    advisory_gdelt = gdeltDf[gdeltDf['link'].isin(links_to_keep)]
 
-# cleanGDELTDf = pd.read_csv(cleanedGdeltPath)
+    print(f"Removed {len(tempDf)} links!")
 
-# tempDf = cleanGDELTDf.copy()
+    print("Creating Similarity Df")
+    similar_df = build_similiar_df(advisory_gdelt)
 
-# for keyword in ADVISORY_WORDS:
-#     tempDf = tempDf[~tempDf['link'].str.contains(keyword, case = False)]
+    similar_links = set(similar_df['string1']) | set(similar_df['string2'])
 
-# with open('bad_links.pkl', 'rb') as f:
-#     existing_set = pickle.load(f)
+    print("Creating groups of similar links")
+    groups = build_similarity_groups(similar_df)
 
-# existing_set = existing_set | (set(tempDf['link']))
+    final_groups = split_groups_by_date(groups)
 
-# with open('full_bad_links.pkl', 'wb') as f:
-#     pickle.dump(existing_set, f)
+    print('Getting links for each group')
+    cannoncial_links = get_all_good_links(final_groups)
 
+    unique_links = links_to_keep - similar_links
 
-# print(len(tempDf))
-# tempDf.to_csv("C:/Users/ucg8nb/Downloads/Bad GDELT.csv", index = False)
+    links_to_keep = cannoncial_links | unique_links
 
-# gdeltDf = pd.read_csv(fullGdeltPath)
-# similarDf = pd.read_csv(similarDfPath)
+    bad_links = all_links - links_to_keep
 
-# similarLinks = set(similarDf['string1']) | set(similarDf['string2'])
+    clean_GDELT = gdeltDf[gdeltDf['link'].isin(links_to_keep)]
 
-# groups = build_similarity_groups(similarDf)
+    print("Storing clean database and bad links")
+    clean_GDELT.to_csv(output_path)
 
-# final_groups = split_groups_by_date(groups)
+    with open(pickle_path, 'wb') as f:
+        pickle.dump(bad_links, f)
 
-# print("Created Groups!")
+# canada_gdelt_path = "C:/Users/ucg8nb/Downloads/GDELT Boil Water Data Canada.csv"
+# clean_path = "C:/Users/ucg8nb/Downloads/Cleaned Canada GDELT.csv"
+# pickle_path = 'bad_links_canada.pkl'
 
-# cannoncial_links = get_all_good_links(final_groups)
-
-# all_links = set(gdeltDf['link'])
-# unique_links = all_links - similarLinks
-
-# links_to_keep = cannoncial_links | unique_links
-
-# bad_links = all_links - links_to_keep
-
-# cleanGdelt = gdeltDf[gdeltDf['link'].isin(links_to_keep)].copy()
-
-# cleanGdelt.to_csv('C:/Users/ucg8nb/Downloads/Clean GDELT.csv')
-# with open('bad_links.pkl', 'wb') as f:
-#     pickle.dump(bad_links, f)
+# full_clean_GDELT(canada_gdelt_path, clean_path, pickle_path=pickle_path)
