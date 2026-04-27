@@ -206,7 +206,7 @@ def full_clean_GDELT(GDELT_path, output_path, pickle_path = 'bad_links'):
     clean_GDELT = gdeltDf[gdeltDf['link'].isin(links_to_keep)]
 
     print("Storing clean database and bad links")
-    clean_GDELT.to_csv(output_path)
+    clean_GDELT.to_csv(output_path, index = False)
 
     with open(pickle_path, 'wb') as f:
         pickle.dump(bad_links, f)

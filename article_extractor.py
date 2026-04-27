@@ -15,6 +15,10 @@ import re
 from rapidfuzz import fuzz, process
 from pathlib import Path
 from urllib.parse import urlparse
+import brotli
+import gzip
+import zlib
+import html as html_lib
 
 load_dotenv()
 
@@ -36,15 +40,49 @@ DATE_REGEX = re.compile(
     re.IGNORECASE
 )
 
-WINDOW = 4
+WINDOW = 2
+
+HTML_RE = re.compile(rb'<\s*(html|!doctype)', re.I)
 
 def is_valid_html(html):
     if not html or len(html) < 500:
         return False
-    invalid_signals = ['enable javascript', 'access denied', 'captcha', 'checking your browser', 'cloudflare']
+    invalid_signals = ['enable javascript', 'access denied', 'captcha', 'checking your browser']
 
     lowered = html.lower()
     return not any(signal in lowered for signal in invalid_signals)
+
+def decode_response(response):
+    encoding = response.headers.get("Content-Encoding", "").lower()
+    raw = response.content
+
+    try:
+        text = response.text
+        if isinstance(text, str) and '<html' in text.lower():
+            return text
+    except Exception:
+        pass
+
+    if bool(HTML_RE.search(raw[:2048])):
+        try:
+            return raw.decode(response.apparent_encoding or 'utf-8', errors = 'ignore')
+        except Exception:
+            return raw.recode('utf-8', errors= 'ignore')
+
+    try:
+        if encoding == "br":
+            html = brotli.decompress(raw).decode("utf-8", errors="ignore")
+        elif encoding == "gzip":
+            html = gzip.decompress(raw).decode("utf-8", errors="ignore")
+        elif encoding == "deflate":
+            html = zlib.decompress(raw).decode("utf-8", errors="ignore")
+        else:
+            response.encoding = response.apparent_encoding
+            html = response.text
+        return html
+    except Exception as e:
+        print(f"Decoding failed for encoding={encoding}: {e}")
+        return None
 
 def render_html_playwright(url):
     with sync_playwright() as p:
@@ -67,9 +105,15 @@ def render_html_complete(url):
         response = requests.get(url, headers = HEADERS, timeout=30)
 
         if response.status_code == 200:
-            html = response.text
+            html = decode_response(response)
+
+            if "&lt;" in html and "<html" not in html.lower():
+                html = html_lib.unescape(html)
+
             if is_valid_html(html):
+                print("Is valid!!!")
                 return html
+
     except Exception:
         pass
 
@@ -90,7 +134,8 @@ def reduce_html(response_text):
 
     soup = BeautifulSoup(response_text, 'html.parser')
 
-    paragraphs = soup.get_text('\n').split("\n")
+    # paragraphs = soup.get_text('\n').split("\n")
+    paragraphs = [line.strip() for line in soup.get_text('\n').split('\n') if line.strip()]
     keep = set()
 
     for i, p in enumerate(paragraphs):
@@ -195,11 +240,10 @@ def get_all_news_text_batched(startPath, endPath, batchSize = 100):
 
         batchStart = batchEnd
 
+cleanVirginiaGDELT = "C:/Users/ucg8nb/Downloads/Clean Virginia GDELT.csv"
+newsText = "C:/Users/ucg8nb/Downloads/Virginia News Text.csv"
 
-cleanGDELT = "C:/Users/ucg8nb/Downloads/Cleaned Canada GDELT.csv"
-newsText = "C:/Users/ucg8nb/Downloads/Canada News Text.csv"
-
-get_all_news_text_batched(cleanGDELT, newsText, batchSize = 100)
+get_all_news_text_batched(cleanVirginiaGDELT, newsText, batchSize = 50)
 
 # gdeltDf = pd.read_csv(cleanGDELT)
 

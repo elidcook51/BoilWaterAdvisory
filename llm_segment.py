@@ -90,8 +90,8 @@ def boil_water_LLM_query(client, advisory_text):
 
     return json.loads(response.output_text)
 
-newsScrapedCsv = "C:/Users/ucg8nb/Downloads/Virginia News Text.csv"
-structuredCsv = "C:/Users/ucg8nb/Downloads/Small Structured Output.csv"
+newsScrapedCsv = "C:/Users/ucg8nb/Downloads/Canada News Text.csv"
+structuredCsv = "C:/Users/ucg8nb/Downloads/Canada First Run.csv"
 
 def unstructured_df_to_structured(inpustCSV, outputCSV, numRows = 100):
 
@@ -113,7 +113,7 @@ def unstructured_df_to_structured(inpustCSV, outputCSV, numRows = 100):
             flat_structured['Source URL'] = row['Link']
 
             rows.append(flat_structured)
-            print(f"Finished row {idx} ({idx / totalCount * 100}% {idx}/{totalCount})!")
+            print(f"Finished row {idx} ({idx / totalCount * 100:.2f}% {idx}/{totalCount})!")
 
         except Exception as e:
             print(f"Failed row {idx}: {e}")
@@ -123,8 +123,8 @@ def unstructured_df_to_structured(inpustCSV, outputCSV, numRows = 100):
 
     print(f"Processed {len(df_structured)} advisories")
 
-# unstructured_df_to_structured(newsScrapedCsv, structuredCsv, numRows = 1000)
+unstructured_df_to_structured(newsScrapedCsv, structuredCsv, numRows = 10000)
 
-structured_data = pd.read_csv(structuredCsv)
-virginiaData = structured_data[structured_data['location_state'] == 'Virginia']
-print(len(virginiaData))
+# structured_data = pd.read_csv(structuredCsv)
+# virginiaData = structured_data[structured_data['location_state'] == 'Virginia']
+# print(len(virginiaData))
