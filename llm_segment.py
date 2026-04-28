@@ -4,6 +4,7 @@ from openai import OpenAI
 import json
 import pandas as pd
 import numpy as np
+from pathlib import Path
 
 BOIL_WATER_STRUCTURE = {
     'type': 'object',
@@ -90,10 +91,25 @@ def boil_water_LLM_query(client, advisory_text):
 
     return json.loads(response.output_text)
 
-newsScrapedCsv = "C:/Users/ucg8nb/Downloads/Canada News Text.csv"
-structuredCsv = "C:/Users/ucg8nb/Downloads/Canada First Run.csv"
+def combine_df_with_csv(df, csvPath):
+    csvPath = Path(csvPath)
+
+    if csvPath.exists():
+        existingDf = pd.read_csv(csvPath)
+        combinedDf = pd.concat([existingDf, df], ignore_index = True)
+    else:
+        combinedDf = df.copy()
+    
+    combinedDf.to_csv(csvPath, index = False)
+
+newsScrapedCsv = "C:/Users/ucg8nb/Downloads/Virginia News Text.csv"
+structuredCsv = "C:/Users/ucg8nb/Downloads/Virginia Run.csv"
 
 def unstructured_df_to_structured(inpustCSV, outputCSV, numRows = 100):
+
+    if os.path.exists(outputCSV):
+        previouslyCompleted = pd.read_csv(outputCSV)
+        doneLinks = set(previouslyCompleted['Source URL'])
 
     fullNews = pd.read_csv(inpustCSV)
     loadedNews = fullNews[fullNews['Loaded']]
@@ -106,20 +122,21 @@ def unstructured_df_to_structured(inpustCSV, outputCSV, numRows = 100):
 
     for idx, row in loadedNews.iterrows():
         try:
-            structured = boil_water_LLM_query(client, row['Text'])
+            if row['Link'] not in doneLinks:
+                structured = boil_water_LLM_query(client, row['Text'])
 
-            flat_structured = flatten_dict(structured)
+                flat_structured = flatten_dict(structured)
 
-            flat_structured['Source URL'] = row['Link']
+                flat_structured['Source URL'] = row['Link']
 
-            rows.append(flat_structured)
-            print(f"Finished row {idx} ({idx / totalCount * 100:.2f}% {idx}/{totalCount})!")
+                rows.append(flat_structured)
+                print(f"Finished row {idx} ({idx / totalCount * 100:.2f}% {idx}/{totalCount})!")
 
         except Exception as e:
             print(f"Failed row {idx}: {e}")
 
     df_structured = pd.DataFrame(rows)
-    df_structured.to_csv(outputCSV, index = False)
+    combine_df_with_csv(df_structured, outputCSV)
 
     print(f"Processed {len(df_structured)} advisories")
 
