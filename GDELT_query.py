@@ -1,6 +1,8 @@
 from google.cloud import bigquery
 import pandas as pd
 
+#To bigquery run "gcloud auth application-default login"
+
 client = bigquery.Client()
 
 outputPath = "C:/Users/ucg8nb/Downloads/GDELT Boil Water Data Canada.csv"
