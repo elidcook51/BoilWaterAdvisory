@@ -166,7 +166,7 @@ def get_all_good_links(groups):
         print(f"Finished group {count}/{totLen} ({count / totLen * 100:.2f}%)")
     return cannoncial_links
 
-def full_clean_GDELT(GDELT_path, output_path, pickle_path = 'bad_links'):
+def full_clean_GDELT(GDELT_path, output_path, pickle_path = 'bad_links', ADVISORY_WORDS = ADVISORY_WORDS):
     gdeltDf = pd.read_csv(GDELT_path)
     all_links = set(gdeltDf['link'])
 

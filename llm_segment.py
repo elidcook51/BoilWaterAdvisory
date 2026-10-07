@@ -11,6 +11,7 @@ BOIL_WATER_STRUCTURE = {
     'properties': {
         'start_date': {'type': ['string', 'null']},
         'end_date': {'type': ['string', 'null']},
+        'article_date': {'type': ['string', 'null']},
         'backup_date': {'type': ['string', 'null']},
         'location': {
             'type': 'object',
@@ -37,6 +38,7 @@ BOIL_WATER_STRUCTURE = {
     "required": [
     "start_date",
     "end_date",
+    "article_date",
     "backup_date",
     "location",
     "advisory_type",
@@ -51,6 +53,7 @@ instructions = (
     "Return ONLY valid JSON matching the exact schema.\n"
     "If a field is not present, use null.\n"
     "If neither start nor end date is known, but other information is known about the timing of the advisory, put that date in backup date. Do not make up information to place in this spot, if no date information is known then put null.\n",
+    'The article publish date should be stored in article_date category. Do not make up a date if the article publish date is not present.'
     'Dates must be YYYY-MM-DD.\n'
     "Emergency boil water advisories are in response to an extreme event happening (pipe burst, loss of pressure etc.), while planned ones are for events such as construction which could cause an issue\n"
     "If the text is not about a boil water advisory return null for all values of the schema but still follow it exactly\n"
