@@ -5,14 +5,29 @@ import json
 import pandas as pd
 import numpy as np
 from pathlib import Path
+import re
 
-BOIL_WATER_STRUCTURE = {
+load_dotenv()
+
+BOIL_WATER_STRUCTURE_V2 = {
     'type': 'object',
     'properties': {
+        'publish_date': {'type': ['string', 'null']},
         'start_date': {'type': ['string', 'null']},
         'end_date': {'type': ['string', 'null']},
-        'article_date': {'type': ['string', 'null']},
         'backup_date': {'type': ['string', 'null']},
+        'backup_date_note': {'type': ['string', 'null']},
+        'date_evidence': {
+            'type': 'object',
+            'properties': {
+                'start_date': {'type': ['string', 'null']},
+                'end_date': {'type': ['string', 'null']},
+                'backup_date': {'type': ['string', 'null']},
+            },
+            'required': ['start_date', 'end_date', 'backup_date'],
+        },
+        'date_notes': {'type': ['string', 'null']},
+        'multiple_advisories': {'type': 'boolean'},
         'location': {
             'type': 'object',
             'properties': {
@@ -20,47 +35,100 @@ BOIL_WATER_STRUCTURE = {
                 'county': {'type': ['string', 'null']},
                 'locality': {'type': ['string', 'null']},
                 'utility_affected': {'type': ['string', 'null']},
-                'PWS_ID': {'type': ['string', 'null']}
+                'PWS_ID': {'type': ['string', 'null']},
             },
-            'required': ['state', 'county', 'locality','utility_affected', 'PWS_ID']
-            },
+            'required': ['state', 'county', 'locality', 'utility_affected', 'PWS_ID'],
+        },
         'advisory_type': {
             'type': 'string',
-            'enum': ['emergency', 'planned', 'unknown']
+            'enum': ['emergency', 'planned', 'unknown'],
         },
         'reason': {'type': ['string', 'null']},
         'people_affected': {'type': ['number', 'null']},
         'source_type': {
             'type': 'string',
-            'enum': ['government website', 'utility website', 'government Facebook', 'utility Facebook', 'media', 'other', 'unknown']
-        }
+            'enum': ['government website', 'utility website', 'government Facebook',
+                     'utility Facebook', 'media', 'other', 'unknown'],
+        },
     },
-    "required": [
-    "start_date",
-    "end_date",
-    "article_date",
-    "backup_date",
-    "location",
-    "advisory_type",
-    "reason",
-    "people_affected",
-    "source_type"
-    ]
+    'required': [
+        'publish_date', 'start_date', 'end_date', 'backup_date', 'backup_date_note',
+        'date_evidence', 'date_notes', 'multiple_advisories', 'location',
+        'advisory_type', 'reason', 'people_affected', 'source_type',
+    ],
 }
 
-instructions = (
-    "Extract structured data from a boil water advisory.\n"
-    "Return ONLY valid JSON matching the exact schema.\n"
-    "If a field is not present, use null.\n"
-    "If neither start nor end date is known, but other information is known about the timing of the advisory, put that date in backup date. Do not make up information to place in this spot, if no date information is known then put null.\n",
-    'The article publish date should be stored in article_date category. Do not make up a date if the article publish date is not present.'
-    'Dates must be YYYY-MM-DD.\n'
-    "Emergency boil water advisories are in response to an extreme event happening (pipe burst, loss of pressure etc.), while planned ones are for events such as construction which could cause an issue\n"
-    "If the text is not about a boil water advisory return null for all values of the schema but still follow it exactly\n"
-    f'Schema is {BOIL_WATER_STRUCTURE}'
-)
+EXTRACTION_INSTRUCTIONS = """You extract structured data about ONE boil water advisory from a news article.
+Return ONLY valid JSON matching the schema exactly. No prose, no code fences, no comments.
+If a field is not stated in the article, use null. Never invent dates, places, or numbers.
 
-load_dotenv()
+You are given ARTICLE METADATA (publish date and source URL) separately from the article text.
+- Echo the provided publish_date back in the publish_date field. Do NOT re-derive it from the text.
+  If no publish date was provided, use null.
+- Use publish_date ONLY to resolve relative date expressions in the text:
+  "yesterday" = publish_date minus 1 day; "last Tuesday" = the most recent Tuesday
+  strictly before publish_date; "effective immediately" / "today" = publish_date.
+  If publish_date is null, leave relative dates as null rather than guessing.
+
+DATE RULES (read carefully -- the old prompt failed here):
+- start_date: the date the advisory TOOK EFFECT. Prefer an explicitly stated effective
+  date ("effective March 3", "beginning Monday"). If the article only gives the
+  announcement/issue date, use that date and say so in date_notes.
+- end_date: the date the advisory was LIFTED or ended ("lifted on Friday",
+  "rescinded March 10"). If the article says the advisory is still active
+  ("until further notice", "remains in effect", present tense with no end date),
+  use null. NEVER use the publish_date as the end_date.
+- backup_date: ONLY a date explicitly tied to THIS advisory's timing that is NEITHER
+  the start NOR the end. Allowed: a water-retest/results date, a public meeting date
+  about the advisory, or the date of a PREVIOUS related advisory (previous-advisory
+  dates go here, never in start_date). If no such date is stated, use null.
+  backup_date is NEVER the publish date.
+- backup_date_note: at most 12 words saying what backup_date refers to
+  (e.g. "water retest date", "date of previous advisory"), or null.
+- date_evidence: for EACH of start_date, end_date, backup_date that is not null,
+  a verbatim quote of at most 25 words from the article supporting that date.
+  If you cannot quote supporting text, the date must be null.
+- date_notes: caveats, e.g. "start_date is the announcement date; effective date
+  not stated". Null if none.
+- All dates must be YYYY-MM-DD.
+
+OTHER RULES:
+- advisory_type: "emergency" for advisories responding to a sudden event (pipe burst,
+  pressure loss, contamination found); "planned" for scheduled work (construction,
+  maintenance); "unknown" otherwise.
+- location: fill state/county/locality/utility_affected/PWS_ID only with what the
+  article states. Do not expand abbreviations into guesses; do not infer the county
+  from the city unless the article names it.
+- people_affected: a number only (e.g. 2000 for "about 2,000 residents"). Null if
+  not stated ("hundreds" -> null, note it in date_notes is wrong place -- just null).
+- source_type: classify the article's publisher.
+- If the article is NOT about a boil water advisory, return null for every field
+  (multiple_advisories=false) but still follow the schema exactly.
+- If the article describes MORE THAN ONE distinct advisory (different towns and/or
+  different dates), extract the FIRST/main one and set multiple_advisories=true.
+
+EXAMPLE:
+Article publish date: 2025-03-05. Source: local news site.
+Article text: "The City of Springfield issued a precautionary boil water advisory
+for the north side on Tuesday after a water main break on Elm Street. About 2,000
+residents are affected. Officials say the advisory will remain in effect until
+further notice. Water samples will be retested on Friday."
+
+Correct output:
+{"publish_date": "2025-03-05", "start_date": "2025-03-04", "end_date": null,
+"backup_date": "2025-03-07", "backup_date_note": "water retest date",
+"date_evidence": {"start_date": "issued a precautionary boil water advisory for the north side on Tuesday",
+"end_date": null, "backup_date": "Water samples will be retested on Friday"},
+"date_notes": null, "multiple_advisories": false,
+"location": {"state": null, "county": null, "locality": "Springfield",
+"utility_affected": null, "PWS_ID": null},
+"advisory_type": "emergency", "reason": "water main break on Elm Street",
+"people_affected": 2000, "source_type": "media"}
+
+Note: "Tuesday" resolved against publish_date 2025-03-05 (a Wednesday) -> 2025-03-04.
+"until further notice" -> end_date null, NOT the publish date. The retest Friday ->
+backup_date with a note. State left null because the article never names it.
+"""
 
 LLM_model = 'gpt-4.1-nano'
 
@@ -84,15 +152,41 @@ def flatten_dict(d, parent_key = "", sep = "_"):
     return items
 
 
-def boil_water_LLM_query(client, advisory_text):
+def extract_advisory(client, article_text, publish_date=None, source_url=None,
+                        model="gpt-4.1-mini"):
+    """Extract one advisory record from article text.
 
-    response = client.responses.create(
-        model = LLM_model,
-        
-        input = f"Follow instructions {instructions} with text {advisory_text}"
+    client: an OpenAI client (as in llm_segment.py).
+    article_text: full extracted article text.
+    publish_date: "YYYY-MM-DD" from dateChecker (or None).
+    source_url: article URL (or None).
+    Returns: dict matching BOIL_WATER_STRUCTURE_V2.
+    Raises: ValueError if the model output cannot be parsed as JSON.
+    """
+    user_block = (
+        f"Article publish date (metadata): {publish_date}\n"
+        f"Article source URL (metadata): {source_url}\n\n"
+        f"Article text:\n{article_text}\n\n"
+        "Extract the advisory as per the instructions and schema."
     )
-
-    return json.loads(response.output_text)
+    response = client.responses.create(
+        model=model,
+        instructions=EXTRACTION_INSTRUCTIONS,
+        input=user_block,
+    )
+    text = response.output_text or ""
+    # Defensive: strip code fences if the model adds them anyway.
+    text = re.sub(r"^```(?:json)?\s*", "", text.strip())
+    text = re.sub(r"\s*```$", "", text)
+    m = re.search(r"\{.*\}", text, flags=re.S)
+    if not m:
+        raise ValueError("LLM did not return JSON.")
+    data = json.loads(m.group(0))
+    # Light validation: all required top-level keys present.
+    missing = [k for k in BOIL_WATER_STRUCTURE_V2["required"] if k not in data]
+    if missing:
+        raise ValueError(f"LLM JSON missing keys: {missing}")
+    return data
 
 def combine_df_with_csv(df, csvPath):
     csvPath = Path(csvPath)
@@ -126,7 +220,7 @@ def unstructured_df_to_structured(inpustCSV, outputCSV, numRows = 100):
     for idx, row in loadedNews.iterrows():
         try:
             if row['Link'] not in doneLinks:
-                structured = boil_water_LLM_query(client, row['Text'])
+                structured = extract_advisory(client, row['Text'])
 
                 flat_structured = flatten_dict(structured)
 
