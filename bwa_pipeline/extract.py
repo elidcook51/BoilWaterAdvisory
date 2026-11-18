@@ -84,7 +84,7 @@ You are given ARTICLE METADATA (publish date and source URL) separately from the
   strictly before publish_date; "effective immediately" / "today" = publish_date.
   If publish_date is null, leave relative dates as null rather than guessing.
 
-DATE RULES (read carefully):
+DATE RULES (read carefully -- the old prompt failed here):
 - start_date: the date the advisory TOOK EFFECT. Prefer an explicitly stated effective
   date ("effective March 3", "beginning Monday"). If the article only gives the
   announcement/issue date, use that date and say so in date_notes.
@@ -154,6 +154,17 @@ def flatten_dict(d, parent_key="", sep="_"):
         else:
             items[new_key] = v
     return items
+
+
+def _empty_columns():
+    """Column names for a header-only structured.csv (empty run)."""
+    record = {k: None for k in BOIL_WATER_STRUCTURE_V2["required"]}
+    record["date_evidence"] = {k: None for k in
+                               ("start_date", "end_date", "backup_date")}
+    record["location"] = {k: None for k in
+                          ("state", "county", "locality", "utility_affected",
+                           "PWS_ID")}
+    return list(flatten_dict(record).keys()) + ["Source URL"]
 
 
 def extract_advisory(client, article_text, publish_date=None, source_url=None,
@@ -269,6 +280,11 @@ def extract_all(texts_csv, out_csv, limit=None):
         processed += 1
         print(f"Finished row {idx} ({processed}/{total} done this run)")
 
+    if processed == 0 and (not out_path.exists()
+                          or out_path.stat().st_size == 0):
+        pd.DataFrame(columns=columns or _empty_columns()).to_csv(
+            out_path, index=False)
+        print(f"Wrote header-only {out_path} (no advisories extracted)")
     print(f"Processed {processed} advisories")
     return processed
 

@@ -12,7 +12,7 @@ is missing -- a missing key never crashes the run.
 import argparse
 import sys
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urljoin
 
@@ -45,6 +45,9 @@ LINK_COLUMNS = ["url", "source", "source_name", "publish_date",
 GDELT_PAUSE = 10
 GDELT_BACKOFFS = (30, 60, 120)
 
+FAILED_COLUMNS = ["source", "window_start", "window_end", "reason",
+                  "attempted_at"]
+
 
 def _today():
     return date.today().isoformat()
@@ -63,25 +66,49 @@ def _row(url, source, source_name="", publish_date="", capture_date=None,
     }
 
 
+def _retry_after_seconds(resp, cap=300):
+    """Seconds from a Retry-After header, or None if absent/unusable.
+
+    Only integer-second values are used; an HTTP-date value falls back
+    to the scheduled backoff.
+    """
+    value = resp.headers.get("retry-after")
+    if value is None:
+        return None
+    try:
+        return max(0, min(int(value), cap))
+    except ValueError:
+        return None
+
+
 def _get(url, params=None, timeout=30, backoffs=(2, 4)):
-    """GET with retries on 429/5xx. Returns the response, or None."""
-    attempts = [0] + list(backoffs)
+    """GET with retries on 429/5xx. Returns the response, or None.
+
+    On a 429 the server's Retry-After header wins over the scheduled
+    backoff (capped at 300s); the backoff tuple is the fallback.
+    """
+    waits = [0] + list(backoffs)
     with httpx.Client(timeout=timeout, follow_redirects=True) as client:
-        for i, wait in enumerate(attempts):
-            if wait:
-                time.sleep(wait)
+        for i in range(len(waits)):
+            if waits[i]:
+                time.sleep(waits[i])
             try:
                 resp = client.get(url, params=params)
             except httpx.HTTPError as e:
-                if i < len(attempts) - 1:
+                if i < len(waits) - 1:
                     print(f"  request failed ({e}); retrying")
                     continue
                 print(f"  request failed ({e}); giving up")
                 return None
-            if resp.status_code == 429 and i < len(attempts) - 1:
-                print("  got 429; backing off")
+            if resp.status_code == 429 and i < len(waits) - 1:
+                retry_after = _retry_after_seconds(resp)
+                if retry_after is not None:
+                    waits[i + 1] = retry_after
+                    print(f"  got 429; server asked for {retry_after}s; backing off")
+                else:
+                    print("  got 429; backing off")
                 continue
-            if resp.status_code >= 500 and i < len(attempts) - 1:
+            if resp.status_code >= 500 and i < len(waits) - 1:
                 continue
             return resp
     return None
@@ -114,28 +141,123 @@ def _gdelt_row(article, query):
                 query=query)
 
 
-def discover_gdelt_doc(since=None, until=None):
+def _read_failed_windows(failed_csv):
+    """Rows of failed_windows.csv as dicts, or [] if missing/unreadable."""
+    path = Path(failed_csv)
+    if not path.exists():
+        return []
+    try:
+        return pd.read_csv(path, dtype=str).fillna("").to_dict("records")
+    except Exception:
+        return []
+
+
+def _record_failed_window(failed_csv, source, window_start, window_end, reason):
+    """Log a failed window, or just refresh attempted_at if already listed.
+
+    A window appears at most once, keyed by (source, window_start,
+    window_end), so re-running a failed week never duplicates the row.
+    """
+    path = Path(failed_csv)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows = _read_failed_windows(path)
+    key = (source, str(window_start), str(window_end))
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    for r in rows:
+        if (r.get("source"), r.get("window_start"), r.get("window_end")) == key:
+            r["attempted_at"] = now
+            r["reason"] = reason
+            break
+    else:
+        rows.append({"source": source, "window_start": str(window_start),
+                     "window_end": str(window_end), "reason": reason,
+                     "attempted_at": now})
+    pd.DataFrame(rows, columns=FAILED_COLUMNS).fillna("").to_csv(path, index=False)
+
+
+def _clear_failed_window(failed_csv, source, window_start, window_end):
+    """Drop one window from failed_windows.csv after a successful retry."""
+    path = Path(failed_csv)
+    if not path.exists():
+        return
+    try:
+        df = pd.read_csv(path, dtype=str).fillna("")
+        keep = ~((df["source"] == source)
+                 & (df["window_start"] == str(window_start))
+                 & (df["window_end"] == str(window_end)))
+        df[keep].to_csv(path, index=False)
+    except Exception:
+        return
+
+
+def _gdelt_week(window_start, window_end, failed_csv):
+    """Fetch one timelinevolinfo week. Returns (rows, failure_reason).
+
+    failure_reason is None on success, even when the week genuinely has
+    0 articles -- a real empty answer is not a failure. A failed week is
+    logged FAILED and recorded in failed_windows.csv; it is never
+    reported as 0 articles.
+    """
+    fmt = lambda d: d.strftime("%Y%m%d") + "000000"
+    resp = _get(GDELT_DOC_URL, params={
+        "query": GDELT_QUERY, "mode": "timelinevolinfo",
+        "STARTDATETIME": fmt(window_start),
+        "ENDDATETIME": fmt(window_end),
+    }, backoffs=GDELT_BACKOFFS)
+    if resp is None:
+        reason = "request failed after retries"
+    elif resp.status_code == 429 or resp.status_code >= 500:
+        reason = f"HTTP {resp.status_code} after retries"
+    else:
+        try:
+            data = resp.json()
+        except ValueError:
+            reason = "response was not valid JSON"
+        else:
+            found = [_gdelt_row(a, GDELT_QUERY) for a in _articles_from_gdelt(data)]
+            print(f"  gdelt {window_start}..{window_end}: {len(found)} articles")
+            return found, None
+    print(f"  gdelt {window_start}..{window_end}: FAILED ({reason})")
+    if failed_csv is not None:
+        _record_failed_window(failed_csv, "gdelt_doc", window_start,
+                              window_end, reason)
+    return [], reason
+
+
+def discover_gdelt_doc(since=None, until=None, failed_csv=None):
     """GDELT DOC API. Recent via artlist; historical via timelinevolinfo.
 
     timelinevolinfo answers go back to Jan 2017, but long responses get
     truncated mid-JSON around 40KB, so history is walked in weekly windows.
+    Weeks that fail are recorded in failed_windows.csv (next to the
+    links.csv, or config.DATA_DIR when called directly) instead of
+    being silently reported as 0 articles.
     """
+    if failed_csv is None:
+        failed_csv = config.DATA_DIR / "failed_windows.csv"
     rows = []
     if since is None:
         resp = _get(GDELT_DOC_URL, params={
             "query": GDELT_QUERY, "mode": "artlist", "format": "json",
             "maxrecords": 250, "timespan": "24h", "sort": "datedesc",
         }, backoffs=GDELT_BACKOFFS)
+        today = date.today()
         if resp is None:
             print("  gdelt artlist request failed; skipping")
+            _record_failed_window(failed_csv, "gdelt_doc", today, today,
+                                  "artlist request failed")
             return rows
         try:
             data = resp.json()
         except ValueError:
             print("  gdelt artlist returned non-JSON; skipping")
+            _record_failed_window(failed_csv, "gdelt_doc", today, today,
+                                  "artlist returned non-JSON")
             return rows
         if not data:
             print("  gdelt artlist returned an empty body; skipping")
+            _record_failed_window(failed_csv, "gdelt_doc", today, today,
+                                  "artlist returned an empty body")
             return rows
         rows = [_gdelt_row(a, GDELT_QUERY) for a in _articles_from_gdelt(data)]
         print(f"  gdelt artlist: {len(rows)} articles")
@@ -146,26 +268,61 @@ def discover_gdelt_doc(since=None, until=None):
     window_start = start
     while window_start <= end:
         window_end = min(window_start + timedelta(days=6), end)
-        fmt = lambda d: d.strftime("%Y%m%d") + "000000"
-        resp = _get(GDELT_DOC_URL, params={
-            "query": GDELT_QUERY, "mode": "timelinevolinfo",
-            "STARTDATETIME": fmt(window_start),
-            "ENDDATETIME": fmt(window_end),
-        }, backoffs=GDELT_BACKOFFS)
-        if resp is None:
-            print(f"  gdelt {window_start}..{window_end}: request failed; skipping window")
-        else:
-            try:
-                data = resp.json()
-            except ValueError:
-                data = {}
-            found = [_gdelt_row(a, GDELT_QUERY) for a in _articles_from_gdelt(data)]
-            print(f"  gdelt {window_start}..{window_end}: {len(found)} articles")
-            rows += found
+        found, _ = _gdelt_week(window_start, window_end, failed_csv)
+        rows += found
         window_start = window_end + timedelta(days=1)
         if window_start <= end:
             time.sleep(GDELT_PAUSE)
     return rows
+
+
+def retry_failed_windows(out_csv, failed_csv):
+    """Re-run the GDELT windows listed in failed_windows.csv.
+
+    Recovered rows are appended to out_csv (deduped by URL against
+    existing rows). A window is removed from the failed list once it
+    returns a real answer, even if that answer is 0 articles. A window
+    that fails again stays listed, with attempted_at refreshed.
+    """
+    failed = [r for r in _read_failed_windows(failed_csv)
+              if r.get("source") == "gdelt_doc"]
+    if not failed:
+        print(f"no failed gdelt_doc windows in {failed_csv}")
+        return 0
+    out = Path(out_csv)
+    existing = set()
+    if out.exists():
+        try:
+            existing = {canonicalize_url(u) for u in
+                        pd.read_csv(out, usecols=["url"], dtype=str)["url"]
+                        if isinstance(u, str)}
+        except Exception:
+            existing = set()
+    recovered = []
+    for entry in failed:
+        ws = parse_date(entry.get("window_start"))
+        we = parse_date(entry.get("window_end"))
+        if ws is None or we is None:
+            print(f"  skipping malformed failed-window row: {entry}")
+            continue
+        found, reason = _gdelt_week(ws, we, failed_csv)
+        if reason is None:
+            _clear_failed_window(failed_csv, "gdelt_doc", ws, we)
+            for r in found:
+                key = canonicalize_url(r["url"])
+                if key and key not in existing:
+                    existing.add(key)
+                    r["url"] = key
+                    recovered.append(r)
+        time.sleep(GDELT_PAUSE)
+    if recovered:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        header = not out.exists() or out.stat().st_size == 0
+        pd.DataFrame(recovered, columns=LINK_COLUMNS).to_csv(
+            out, mode="a", header=header, index=False)
+    print(f"retried {len(failed)} failed windows, "
+          f"recovered {len(recovered)} new links")
+    return len(recovered)
 
 
 def _resolve_google_news_url(url):
@@ -414,7 +571,8 @@ def discover_all(out_csv, since=None, until=None, sources=None):
         print(f"discovering from {name}...")
         try:
             if name == "gdelt_doc":
-                rows += fn(since, until)
+                rows += fn(since, until,
+                           Path(out_csv).parent / "failed_windows.csv")
             elif name == "gnews":
                 rows += fn(since, until)
             else:
@@ -452,7 +610,17 @@ def main():
                         help="comma-separated subset of: " + ",".join(SOURCES))
     parser.add_argument("--limit", type=int, default=None,
                         help="cap the number of links written (smoke tests)")
+    parser.add_argument("--retry-failed", nargs="?", const="", default=None,
+                        metavar="FAILED_CSV",
+                        help="retry only the GDELT windows in failed_windows.csv "
+                             "(default: failed_windows.csv next to --out)")
     args = parser.parse_args()
+
+    if args.retry_failed is not None:
+        failed_path = (Path(args.retry_failed) if args.retry_failed
+                       else Path(args.out).parent / "failed_windows.csv")
+        retry_failed_windows(args.out, failed_path)
+        return
 
     sources = [s.strip() for s in args.sources.split(",")] if args.sources else None
     df = discover_all(args.out, since=args.since, until=args.until,

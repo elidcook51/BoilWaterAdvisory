@@ -7,6 +7,11 @@ Run one stage on its own or the whole pipeline:
     python run.py dedupe
     python run.py full
 
+Harvesters that bypass the rate-limited GDELT DOC API (their rows are
+merged into links.csv, so the rest of the pipeline is unchanged):
+    python run.py gkg      # GDELT bulk GKG files, 2015-02-18 onward
+    python run.py bq       # GDELT GKG table in BigQuery (needs BQ_KEY_FILE)
+
 Each stage is its own script, run as a subprocess, so it can also be run
 directly (for example: python extract.py --texts data/texts.csv
 --out data/structured.csv). The `full` command just chains the stages and
@@ -54,11 +59,8 @@ def _merge_links(files, out_path):
                     continue
                 seen.add(url)
                 rows.append(row)
-    if rows:
-        fieldnames = list(rows[0].keys())
-    else:
-        fieldnames = ["url", "source", "source_name", "publish_date",
-                      "capture_date", "title", "query"]
+    fieldnames = ["url", "source", "source_name", "publish_date",
+                  "capture_date", "title", "query"]
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
@@ -66,9 +68,23 @@ def _merge_links(files, out_path):
     print(f"Merged {len(rows)} links into {out_path}")
 
 
-def discover(data_dir, since, until, backfill, limit, sources=None):
+def _merge_into_links(data_dir, new_file):
+    """Merge one harvester's output file into the shared links.csv."""
+    links = data_dir / "links.csv"
+    inputs = [p for p in (links, new_file) if p.exists()]
+    if not inputs:
+        print(f"Nothing to merge into {links}")
+        return
+    _merge_links(inputs, links)
+
+
+def discover(data_dir, since, until, backfill, limit, sources=None,
+             retry_failed=False):
     data_dir.mkdir(parents=True, exist_ok=True)
     links = data_dir / "links.csv"
+    if retry_failed:
+        run_stage("discover.py", "--out", links, "--retry-failed")
+        return
     extra = ["--limit", limit] if limit else []
     if sources:
         extra += ["--sources", sources]
@@ -85,6 +101,51 @@ def discover(data_dir, since, until, backfill, limit, sources=None):
     else:
         run_stage("discover.py", "--out", links,
                   "--since", since, "--until", until, *extra)
+
+
+def gkg(data_dir, since, until, backfill, limit):
+    """Harvest links from GDELT bulk GKG files, merge into links.csv."""
+    data_dir.mkdir(parents=True, exist_ok=True)
+    out = data_dir / "links_gkg.csv"
+    if backfill:
+        start_year, end_year = backfill
+        for year in range(start_year, end_year + 1):
+            args = ["--out", out, "--since", f"{year}-01-01",
+                    "--until", f"{year}-12-31", "--resume"]
+            if limit:
+                args += ["--limit", limit]
+            run_stage("gkg.py", *args)
+    else:
+        args = ["--out", out, "--since", since, "--until", until, "--resume"]
+        if limit:
+            args += ["--limit", limit]
+        run_stage("gkg.py", *args)
+    _merge_into_links(data_dir, out)
+
+
+def bq(data_dir, since, until, backfill, limit, dry_run=False):
+    """Harvest links from GDELT's GKG table in BigQuery, merge into links.csv."""
+    data_dir.mkdir(parents=True, exist_ok=True)
+    out = data_dir / "links_bq.csv"
+    if backfill:
+        start_year, end_year = backfill
+        for year in range(start_year, end_year + 1):
+            args = ["--out", out, "--since", f"{year}-01-01",
+                    "--until", f"{year}-12-31"]
+            if limit:
+                args += ["--limit", limit]
+            if dry_run:
+                args += ["--dry-run"]
+            run_stage("bq.py", *args)
+    else:
+        args = ["--out", out, "--since", since, "--until", until]
+        if limit:
+            args += ["--limit", limit]
+        if dry_run:
+            args += ["--dry-run"]
+        run_stage("bq.py", *args)
+    if not dry_run:
+        _merge_into_links(data_dir, out)
 
 
 def fetch(data_dir, limit):
@@ -109,10 +170,11 @@ def dedupe(data_dir):
               "--review", data_dir / "dedup_review.csv")
 
 
-def full(data_dir, since, until, backfill, limit, sources=None):
+def full(data_dir, since, until, backfill, limit, sources=None,
+         retry_failed=False):
     stages = [
         ("discover", lambda: discover(data_dir, since, until, backfill, limit,
-                                      sources)),
+                                      sources, retry_failed)),
         ("fetch", lambda: fetch(data_dir, limit)),
         ("extract", lambda: extract(data_dir, limit)),
         ("dedupe", lambda: dedupe(data_dir)),
@@ -144,6 +206,12 @@ def main():
                         help="comma-separated discovery sources for the discover "
                              "stage (gdelt_doc,google_news_rss,gnews,newsdata,"
                              "mediacloud,gov); default is all of them")
+    common.add_argument("--retry-failed", action="store_true",
+                        help="discover stage only: retry the GDELT weeks listed "
+                             "in failed_windows.csv instead of discovering")
+    common.add_argument("--dry-run", action="store_true",
+                        help="bq stage only: report estimated BigQuery bytes "
+                             "without executing anything")
 
     parser = argparse.ArgumentParser(
         description="Run the boil water advisory pipeline, one stage or all of it.",
@@ -151,6 +219,10 @@ def main():
     sub = parser.add_subparsers(dest="stage", required=True)
     sub.add_parser("discover", parents=[common],
                    help="collect candidate article links")
+    sub.add_parser("gkg", parents=[common],
+                   help="harvest links from GDELT bulk GKG files (2015+)")
+    sub.add_parser("bq", parents=[common],
+                   help="harvest links from GDELT GKG in BigQuery")
     sub.add_parser("fetch", parents=[common],
                    help="download article text for each link")
     sub.add_parser("extract", parents=[common],
@@ -167,12 +239,18 @@ def main():
     data_dir = Path(args.data_dir)
     stages = {
         "discover": lambda: discover(data_dir, args.since, args.until,
-                                     args.backfill, args.limit, args.sources),
+                                     args.backfill, args.limit, args.sources,
+                                     args.retry_failed),
+        "gkg": lambda: gkg(data_dir, args.since, args.until,
+                           args.backfill, args.limit),
+        "bq": lambda: bq(data_dir, args.since, args.until,
+                         args.backfill, args.limit, args.dry_run),
         "fetch": lambda: fetch(data_dir, args.limit),
         "extract": lambda: extract(data_dir, args.limit),
         "dedupe": lambda: dedupe(data_dir),
         "full": lambda: full(data_dir, args.since, args.until,
-                             args.backfill, args.limit, args.sources),
+                             args.backfill, args.limit, args.sources,
+                             args.retry_failed),
     }
     stages[args.stage]()
 

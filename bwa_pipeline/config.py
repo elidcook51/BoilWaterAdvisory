@@ -5,6 +5,9 @@ Put API keys in a .env file at the repo head (never commit it):
     GNEWS_API_KEY=...          # optional, gnews.io (free: 100 requests/day)
     NEWSDATA_API_KEY=...       # optional, newsdata.io (free tier)
     MEDIACLOUD_API_KEY=...     # optional, mediacloud.org (free research key)
+    BQ_KEY_FILE=...            # optional, path to a Google Cloud
+                               # service-account JSON key (BigQuery User
+                               # role) for the GDELT BigQuery harvester
 
 Paths are relative to the bwa_pipeline/ folder unless you override them
 on the command line.
@@ -26,6 +29,7 @@ OPEN_AI_API_KEY = os.getenv("OPEN_AI_API_KEY")
 GNEWS_API_KEY = os.getenv("GNEWS_API_KEY")
 NEWSDATA_API_KEY = os.getenv("NEWSDATA_API_KEY")
 MEDIACLOUD_API_KEY = os.getenv("MEDIACLOUD_API_KEY")
+BQ_KEY_FILE = os.getenv("BQ_KEY_FILE")
 
 # Fetching: identify the bot, retry briefly, drop junk pages.
 USER_AGENT = "BoilWaterAdvisoryBot/1.0 (academic research project)"
