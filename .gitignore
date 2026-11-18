@@ -2,3 +2,4 @@
 .venv
 bwa_crawler
 *.csv
+*__pycache__
