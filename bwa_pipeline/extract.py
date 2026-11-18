@@ -84,7 +84,7 @@ You are given ARTICLE METADATA (publish date and source URL) separately from the
   strictly before publish_date; "effective immediately" / "today" = publish_date.
   If publish_date is null, leave relative dates as null rather than guessing.
 
-DATE RULES (read carefully -- the old prompt failed here):
+DATE RULES (read carefully):
 - start_date: the date the advisory TOOK EFFECT. Prefer an explicitly stated effective
   date ("effective March 3", "beginning Monday"). If the article only gives the
   announcement/issue date, use that date and say so in date_notes.
