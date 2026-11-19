@@ -8,6 +8,10 @@ Put API keys in a .env file at the repo head (never commit it):
     BQ_KEY_FILE=...            # optional, path to a Google Cloud
                                # service-account JSON key (BigQuery User
                                # role) for the GDELT BigQuery harvester
+    BROWSER_HEADERS_FILE=...   # optional, path to a JSON file with your
+                               # own browser's request headers (see
+                               # fetch.py); without it, a generic
+                               # browser-like header set is sent
 
 Paths are relative to the bwa_pipeline/ folder unless you override them
 on the command line.
@@ -30,6 +34,7 @@ GNEWS_API_KEY = os.getenv("GNEWS_API_KEY")
 NEWSDATA_API_KEY = os.getenv("NEWSDATA_API_KEY")
 MEDIACLOUD_API_KEY = os.getenv("MEDIACLOUD_API_KEY")
 BQ_KEY_FILE = os.getenv("BQ_KEY_FILE")
+BROWSER_HEADERS_FILE = os.getenv("BROWSER_HEADERS_FILE")
 
 # Fetching: identify the bot, retry briefly, drop junk pages.
 USER_AGENT = "BoilWaterAdvisoryBot/1.0 (academic research project)"

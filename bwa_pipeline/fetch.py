@@ -19,6 +19,7 @@ Wayback CDX covers the same recovery job at a fraction of the cost.
 
 import argparse
 import csv
+import json
 import re
 import sys
 import threading
@@ -47,6 +48,43 @@ WAYBACK_CDX = "https://web.archive.org/cdx/search/cdx"
 _robots_cache = {}
 _robots_lock = threading.Lock()
 
+# Browsers send a full header set with every navigation; a bare
+# User-Agent alone is what bot filters key on (one site 429'd the bot
+# UA alone and answered 200 once these headers were added, with the
+# bot UA kept). These defaults are sent on every request the fetcher
+# makes (live, robots.txt, Wayback). Point BROWSER_HEADERS_FILE at a
+# JSON file of your own browser's headers to use those instead -- a
+# User-Agent in the file replaces the bot UA too.
+DEFAULT_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+_headers_cache = None
+
+
+def _request_headers():
+    """Header dict for fetcher requests (cached after the first call)."""
+    global _headers_cache
+    if _headers_cache is not None:
+        return _headers_cache
+    headers = dict(DEFAULT_HEADERS)
+    headers["User-Agent"] = config.USER_AGENT
+    path = getattr(config, "BROWSER_HEADERS_FILE", "") or ""
+    if path:
+        try:
+            with open(path, encoding="utf-8") as f:
+                custom = json.load(f)
+            headers.update({str(k): str(v) for k, v in custom.items()})
+        except Exception as e:
+            print(f"  warning: could not read BROWSER_HEADERS_FILE: {e}")
+    _headers_cache = headers
+    return headers
+
 
 def _allowed(url):
     """True unless the site's robots.txt disallows our user-agent."""
@@ -57,7 +95,7 @@ def _allowed(url):
         parser = RobotFileParser()
         try:
             resp = httpx.get(urljoin(url, "/robots.txt"), timeout=5,
-                             headers={"User-Agent": config.USER_AGENT})
+                             headers=_request_headers())
             parser.parse(resp.text.splitlines())
         except Exception:
             # No robots.txt (or unreachable): fail open.
@@ -99,12 +137,12 @@ def _fetch_live(url, client=None):
     clients are thread-safe). If None, a throwaway client is created,
     as before.
     """
-    headers = {"User-Agent": config.USER_AGENT}
     waits = [0] + [2 ** i for i in range(config.FETCH_RETRIES)]
     own_client = client is None
     if own_client:
         client = httpx.Client(timeout=config.FETCH_TIMEOUT,
-                              follow_redirects=True, headers=headers)
+                              follow_redirects=True,
+                              headers=_request_headers())
     try:
         for i, wait in enumerate(waits):
             if wait:
@@ -150,25 +188,28 @@ def _fetch_live(url, client=None):
 def _fetch_wayback(url):
     """Archived copy via the Wayback CDX API. Returns (html, note).
 
-    The CDX lookup is retried (3 attempts, 2s/4s backoff): a single
+    The CDX lookup is retried once (2 attempts, 2s backoff): a single
     slow lookup used to be a permanent FAILED for the URL, and under
     parallel load several lookups queue on archive.org at once, so a
     transient 20s timeout is common enough to need a second chance.
     Only the lookup is retried -- a real "no snapshot" answer is final.
+    Two attempts cover the transient case; a third only lengthens the
+    worst case when archive.org is persistently slow for this IP.
     """
     data = None
-    for attempt, wait in enumerate([0, 2, 4]):
+    for attempt, wait in enumerate([0, 2]):
         if wait:
             time.sleep(wait)
         try:
             resp = httpx.get(WAYBACK_CDX, params={
                 "url": url, "output": "json",
                 "filter": "statuscode:200", "limit": 1,
-            }, timeout=20, follow_redirects=True)
+            }, timeout=20, follow_redirects=True,
+            headers=_request_headers())
             data = resp.json()
             break
         except Exception as e:
-            if attempt == 2:
+            if attempt == 1:
                 return None, f"wayback lookup failed: {e}"
     # First row is the header; rows after it are snapshots.
     if not isinstance(data, list) or len(data) < 2:
@@ -179,7 +220,7 @@ def _fetch_wayback(url):
     try:
         resp = httpx.get(snapshot, timeout=config.FETCH_TIMEOUT,
                          follow_redirects=True,
-                         headers={"User-Agent": config.USER_AGENT})
+                         headers=_request_headers())
     except httpx.HTTPError as e:
         return None, f"wayback fetch failed: {e}"
     if resp.status_code != 200:
@@ -299,7 +340,8 @@ def _fetch_one(args):
 
 
 def fetch_all(links_csv, out_csv, limit=None, workers=1, per_host=2,
-              wayback_max=3, host_delay=1.0, max_rate=10):
+              wayback_max=3, host_delay=1.0, max_rate=10,
+              heartbeat_secs=30):
     """Fetch every URL in links.csv, resuming past URLs already in out_csv.
 
     workers=1 is the original sequential loop. With workers=N, N URLs are
@@ -310,7 +352,9 @@ def fetch_all(links_csv, out_csv, limit=None, workers=1, per_host=2,
     minimum gap in seconds between two requests to the same website
     (default 1.0); max_rate caps total requests per second across all
     websites (default 10, 0 for no cap). The rate floors only matter
-    with workers > 1.
+    with workers > 1. heartbeat_secs prints a progress line every N
+    seconds while fetching (default 30, 0 for none), so a long run on
+    slow sites shows it is still working instead of looking stuck.
     """
     links = pd.read_csv(links_csv, dtype=str).fillna("")
     done = set()
@@ -331,47 +375,68 @@ def fetch_all(links_csv, out_csv, limit=None, workers=1, per_host=2,
 
     new_file = not out.exists() or out.stat().st_size == 0
     count = ok = 0
-    with httpx.Client(timeout=config.FETCH_TIMEOUT, follow_redirects=True,
-                      headers={"User-Agent": config.USER_AGENT}) as client:
-        with open(out, "a", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=TEXT_COLUMNS)
-            if new_file:
-                writer.writeheader()
+    started = time.monotonic()
+    stop_hb = threading.Event()
 
-            def write_row(url, publish_date, source, loaded, text, note):
-                nonlocal count, ok
-                count += 1
-                writer.writerow({
-                    "Link": url,
-                    "Loaded": loaded,
-                    "Text": text if loaded else "",
-                    "publish_date": publish_date,
-                    "source": source,
-                })
-                f.flush()
-                if loaded:
-                    ok += 1
-                    print(f"  [{count}] ok ({note}): {url[:80]}")
+    def _heartbeat():
+        while not stop_hb.wait(heartbeat_secs):
+            print(f"  ... {count}/{len(pending)} done, "
+                  f"{time.monotonic() - started:.0f}s elapsed")
+
+    if heartbeat_secs:
+        threading.Thread(target=_heartbeat, daemon=True).start()
+    try:
+        with httpx.Client(timeout=config.FETCH_TIMEOUT, follow_redirects=True,
+                          headers=_request_headers()) as client:
+            with open(out, "a", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=TEXT_COLUMNS)
+                if new_file:
+                    writer.writeheader()
+
+                def write_row(url, publish_date, source, loaded, text, note):
+                    nonlocal count, ok
+                    count += 1
+                    writer.writerow({
+                        "Link": url,
+                        "Loaded": loaded,
+                        "Text": text if loaded else "",
+                        "publish_date": publish_date,
+                        "source": source,
+                    })
+                    f.flush()
+                    if loaded:
+                        ok += 1
+                        print(f"  [{count}] ok ({note}): {url[:80]}")
+                    else:
+                        print(f"  [{count}] FAILED ({note}): {url[:80]}")
+
+                limiter = (_HostLimiter(per_host=per_host,
+                                       wayback=wayback_max,
+                                       host_delay=host_delay,
+                                       max_rate=max_rate)
+                           if workers > 1 else None)
+                if workers <= 1:
+                    for url, publish_date, source in pending:
+                        loaded, text, note = fetch_text(url, client=client)
+                        write_row(url, publish_date, source, loaded, text, note)
                 else:
-                    print(f"  [{count}] FAILED ({note}): {url[:80]}")
-
-            limiter = (_HostLimiter(per_host=per_host,
-                                   wayback=wayback_max,
-                                   host_delay=host_delay,
-                                   max_rate=max_rate)
-                       if workers > 1 else None)
-            if workers <= 1:
-                for url, publish_date, source in pending:
-                    loaded, text, note = fetch_text(url, client=client)
-                    write_row(url, publish_date, source, loaded, text, note)
-            else:
-                jobs = [(url, client, limiter) for url, _, _ in pending]
-                with ThreadPoolExecutor(max_workers=workers) as pool:
-                    for (url, loaded, text, note), (_, publish_date,
-                                                    source) in zip(
-                            pool.map(_fetch_one, jobs), pending):
-                        write_row(url, publish_date, source,
-                                  loaded, text, note)
+                    jobs = [(url, client, limiter) for url, _, _ in pending]
+                    pool = ThreadPoolExecutor(max_workers=workers)
+                    try:
+                        for (url, loaded, text, note), (_, publish_date,
+                                                        source) in zip(
+                                pool.map(_fetch_one, jobs), pending):
+                            write_row(url, publish_date, source,
+                                      loaded, text, note)
+                    except KeyboardInterrupt:
+                        pool.shutdown(wait=False, cancel_futures=True)
+                        print("  interrupted -- partial results saved in "
+                              f"{out_csv}")
+                        raise
+                    else:
+                        pool.shutdown(wait=True)
+    finally:
+        stop_hb.set()
     print(f"fetched {count} new links, {ok} with usable text")
     return count, ok
 
