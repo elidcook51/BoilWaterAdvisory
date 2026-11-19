@@ -1,8 +1,10 @@
 beautifulsoup4
+curl_cffi==0.17.0
 feedparser
 gnews
 google-cloud-bigquery
 httpx
+langdetect
 openai
 pandas
 python-dotenv

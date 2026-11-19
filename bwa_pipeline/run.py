@@ -153,7 +153,8 @@ def bq(data_dir, since, until, backfill, limit, dry_run=False, slim=False):
 
 
 def fetch(data_dir, limit, workers=1, per_host=2, wayback_max=3,
-          host_delay=1.0, max_rate=10):
+          host_delay=1.0, max_rate=20, curl_cffi=True, chunk_size=2000,
+          retry_failed=False):
     args = ["--links", data_dir / "links.csv", "--out", data_dir / "texts.csv"]
     if limit:
         args += ["--limit", limit]
@@ -165,8 +166,14 @@ def fetch(data_dir, limit, workers=1, per_host=2, wayback_max=3,
         args += ["--wayback-max", str(wayback_max)]
     if host_delay is not None and host_delay != 1.0:
         args += ["--per-host-delay", str(host_delay)]
-    if max_rate is not None and max_rate != 10:
+    if max_rate is not None and max_rate != 20:
         args += ["--max-rate", str(max_rate)]
+    if not curl_cffi:
+        args += ["--no-curl-cffi"]
+    if chunk_size and chunk_size != 2000:
+        args += ["--chunk-size", str(chunk_size)]
+    if retry_failed:
+        args += ["--retry-failed"]
     run_stage("fetch.py", *args)
 
 
@@ -187,12 +194,13 @@ def dedupe(data_dir):
 
 def full(data_dir, since, until, backfill, limit, sources=None,
          retry_failed=False, workers=1, per_host=2, wayback_max=3,
-         host_delay=1.0, max_rate=10):
+         host_delay=1.0, max_rate=20, curl_cffi=True, chunk_size=2000):
     stages = [
         ("discover", lambda: discover(data_dir, since, until, backfill, limit,
                                       sources, retry_failed)),
         ("fetch", lambda: fetch(data_dir, limit, workers, per_host,
-                                wayback_max, host_delay, max_rate)),
+                                wayback_max, host_delay, max_rate,
+                                curl_cffi, chunk_size, retry_failed)),
         ("extract", lambda: extract(data_dir, limit)),
         ("dedupe", lambda: dedupe(data_dir)),
     ]
@@ -224,8 +232,11 @@ def main():
                              "stage (gdelt_doc,google_news_rss,gnews,newsdata,"
                              "mediacloud,gov); default is all of them")
     common.add_argument("--retry-failed", action="store_true",
-                        help="discover stage only: retry the GDELT weeks listed "
-                             "in failed_windows.csv instead of discovering")
+                        help="discover stage: retry the GDELT weeks listed "
+                             "in failed_windows.csv instead of discovering; "
+                             "fetch stage: re-attempt only rows previously "
+                             "recorded FAILED (or wayback-retry) instead of "
+                             "resuming past them")
     common.add_argument("--dry-run", action="store_true",
                         help="bq stage only: report estimated BigQuery bytes "
                              "without executing anything")
@@ -243,10 +254,20 @@ def main():
                         help="fetch stage only: minimum seconds between two "
                              "requests to the same website (default 1.0; "
                              "only with --workers)")
-    common.add_argument("--max-rate", type=float, default=10,
+    common.add_argument("--max-rate", type=float, default=20,
                         help="fetch stage only: max requests per second "
-                             "across all websites (default 10; 0 for no "
+                             "across all websites (default 20; 0 for no "
                              "cap; only with --workers)")
+    common.add_argument("--curl-cffi", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="fetch stage only: try curl_cffi "
+                             "impersonate=chrome as a second attempt after "
+                             "httpx 403/429 (default on; --no-curl-cffi "
+                             "disables it)")
+    common.add_argument("--chunk-size", type=int, default=2000,
+                        help="fetch stage only: URLs submitted per chunk "
+                             "(default 2000; a slow URL stalls only its "
+                             "own chunk)")
     common.add_argument("--slim", action="store_true",
                         help="bq stage only: read only DATE + URL from BigQuery "
                              "and filter on the URL slug alone (far fewer bytes "
@@ -287,14 +308,17 @@ def main():
                          args.backfill, args.limit, args.dry_run, args.slim),
         "fetch": lambda: fetch(data_dir, args.limit, args.workers,
                                args.per_host, args.wayback_max,
-                               args.per_host_delay, args.max_rate),
+                               args.per_host_delay, args.max_rate,
+                               args.curl_cffi, args.chunk_size,
+                               args.retry_failed),
         "extract": lambda: extract(data_dir, args.limit),
         "dedupe": lambda: dedupe(data_dir),
         "full": lambda: full(data_dir, args.since, args.until,
                              args.backfill, args.limit, args.sources,
                              args.retry_failed, args.workers,
                              args.per_host, args.wayback_max,
-                             args.per_host_delay, args.max_rate),
+                             args.per_host_delay, args.max_rate,
+                             args.curl_cffi, args.chunk_size),
     }
     stages[args.stage]()
 

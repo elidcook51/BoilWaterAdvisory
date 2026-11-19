@@ -39,8 +39,28 @@ BROWSER_HEADERS_FILE = os.getenv("BROWSER_HEADERS_FILE")
 # Fetching: identify the bot, retry briefly, drop junk pages.
 USER_AGENT = "BoilWaterAdvisoryBot/1.0 (academic research project)"
 FETCH_TIMEOUT = 20
-FETCH_RETRIES = 3
+# Live attempts per URL = FETCH_RETRIES + 1 = 3 (v3 per-URL budget).
+FETCH_RETRIES = 2
 MIN_TEXT_CHARS = 300
+
+# v3 fetcher defaults.
+MAX_RATE = 20              # global requests/second cap (0 for no cap)
+CURL_CFFI = True           # try curl_cffi impersonate="chrome" as a
+                           # second attempt after an httpx 403/429
+CHUNK_SIZE = 2000          # URLs submitted per chunk; rows are written
+                           # in input order within each chunk, so one
+                           # slow URL stalls only its chunk
+FETCH_CONNECT_TIMEOUT = 5  # per-phase timeouts for live fetches (s)
+FETCH_READ_TIMEOUT = 15
+FETCH_WRITE_TIMEOUT = 10
+FETCH_POOL_TIMEOUT = 5
+CDX_TIMEOUT = 10           # seconds per Wayback CDX attempt (2 attempts)
+SNAPSHOT_TIMEOUT = 15      # seconds for a Wayback snapshot fetch
+ROBOTS_CACHE_TTL_HOURS = 24
+STATE_DB_SUFFIX = "_state.db"       # appended to the out-file stem
+MANIFEST_SUFFIX = "_manifest.json"  # appended to the out-file stem
+PARKED_HOSTS_FILE = "parked_hosts.json"  # beside the out file
+ROBOTS_CACHE_FILE = "robots_cache.json"  # beside the state DB
 
 # Discovery queries. The same list feeds every search-based source so
 # results are comparable across them.
