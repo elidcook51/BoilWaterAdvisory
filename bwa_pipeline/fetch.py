@@ -6,6 +6,11 @@ robots.txt first, and extracts the article text with trafilatura
 marked Loaded=False. When the live fetch fails, the Wayback Machine's
 archived copy is tried before giving up.
 
+Pass --workers N to fetch N URLs concurrently (threads; the work is
+network-bound, so threads are the right tool). Output order matches the
+input order, and re-runs still resume past URLs already in the output
+file, so a parallel run is interchangeable with a sequential one.
+
 No Common Crawl index-lookup path here: CC-NEWS has no usable URL index
 (the community index was never verified), so searching it means streaming
 whole monthly WARC files -- far too heavy for a per-article fallback.
@@ -16,7 +21,9 @@ import argparse
 import csv
 import re
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 from urllib.robotparser import RobotFileParser
@@ -37,12 +44,15 @@ TEXT_COLUMNS = ["Link", "Loaded", "Text", "publish_date", "source"]
 WAYBACK_CDX = "https://web.archive.org/cdx/search/cdx"
 
 _robots_cache = {}
+_robots_lock = threading.Lock()
 
 
 def _allowed(url):
     """True unless the site's robots.txt disallows our user-agent."""
     domain = urlparse(url).netloc
-    if domain not in _robots_cache:
+    with _robots_lock:
+        parser = _robots_cache.get(domain, False)
+    if parser is False:
         parser = RobotFileParser()
         try:
             resp = httpx.get(urljoin(url, "/robots.txt"), timeout=5,
@@ -51,8 +61,8 @@ def _allowed(url):
         except Exception:
             # No robots.txt (or unreachable): fail open.
             parser = None
-        _robots_cache[domain] = parser
-    parser = _robots_cache[domain]
+        with _robots_lock:
+            _robots_cache.setdefault(domain, parser)
     if parser is None:
         return True
     try:
@@ -81,12 +91,20 @@ def _extract_text(html, url):
     return text.strip()
 
 
-def _fetch_live(url):
-    """One URL with retries. Returns (html, note) or (None, note)."""
+def _fetch_live(url, client=None):
+    """One URL with retries. Returns (html, note) or (None, note).
+
+    client: an httpx.Client to reuse (shared across threads; httpx
+    clients are thread-safe). If None, a throwaway client is created,
+    as before.
+    """
     headers = {"User-Agent": config.USER_AGENT}
     waits = [0] + [2 ** i for i in range(config.FETCH_RETRIES)]
-    with httpx.Client(timeout=config.FETCH_TIMEOUT, follow_redirects=True,
-                      headers=headers) as client:
+    own_client = client is None
+    if own_client:
+        client = httpx.Client(timeout=config.FETCH_TIMEOUT,
+                              follow_redirects=True, headers=headers)
+    try:
         for i, wait in enumerate(waits):
             if wait:
                 time.sleep(wait)
@@ -106,6 +124,9 @@ def _fetch_live(url):
             if "html" not in content_type and content_type:
                 return None, f"not HTML ({content_type})"
             return resp.text, "live"
+    finally:
+        if own_client:
+            client.close()
     return None, "request failed"
 
 
@@ -136,15 +157,16 @@ def _fetch_wayback(url):
     return resp.text, "wayback"
 
 
-def fetch_text(url):
+def fetch_text(url, client=None):
     """Fetch and extract one article.
 
     Returns (loaded, text, note). loaded is False when nothing usable
-    came back; note says why.
+    came back; note says why. client, if given, is a shared httpx.Client
+    reused across calls (and threads).
     """
     if not _allowed(url):
         return False, "", "blocked by robots.txt"
-    html, note = _fetch_live(url)
+    html, note = _fetch_live(url, client=client)
     if html:
         text = _extract_text(html, url)
         if len(text) >= config.MIN_TEXT_CHARS:
@@ -160,8 +182,23 @@ def fetch_text(url):
     return False, "", wb_note
 
 
-def fetch_all(links_csv, out_csv, limit=None):
-    """Fetch every URL in links.csv, resuming past URLs already in out_csv."""
+def _fetch_one(args):
+    """Worker for the thread pool: fetch one URL, never raise."""
+    url, client = args
+    try:
+        loaded, text, note = fetch_text(url, client=client)
+    except Exception as e:
+        return url, False, "", f"worker failed: {e}"
+    return url, loaded, text if loaded else "", note
+
+
+def fetch_all(links_csv, out_csv, limit=None, workers=1):
+    """Fetch every URL in links.csv, resuming past URLs already in out_csv.
+
+    workers=1 is the original sequential loop. With workers=N, N URLs are
+    fetched concurrently and rows are written in input order, so the output
+    file is identical to a sequential run (modulo timing).
+    """
     links = pd.read_csv(links_csv, dtype=str).fillna("")
     done = set()
     out = Path(out_csv)
@@ -169,33 +206,54 @@ def fetch_all(links_csv, out_csv, limit=None):
     if out.exists():
         done = set(pd.read_csv(out, dtype=str).fillna("")["Link"])
 
+    pending = []
+    for _, link_row in links.iterrows():
+        url = (link_row.get("url") or "").strip()
+        if not url or url in done:
+            continue
+        if limit is not None and len(pending) >= limit:
+            break
+        pending.append((url, link_row.get("publish_date", ""),
+                        link_row.get("source", "")))
+
     new_file = not out.exists() or out.stat().st_size == 0
     count = ok = 0
-    with open(out, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=TEXT_COLUMNS)
-        if new_file:
-            writer.writeheader()
-        for _, link_row in links.iterrows():
-            url = (link_row.get("url") or "").strip()
-            if not url or url in done:
-                continue
-            if limit is not None and count >= limit:
-                break
-            count += 1
-            loaded, text, note = fetch_text(url)
-            writer.writerow({
-                "Link": url,
-                "Loaded": loaded,
-                "Text": text if loaded else "",
-                "publish_date": link_row.get("publish_date", ""),
-                "source": link_row.get("source", ""),
-            })
-            f.flush()
-            if loaded:
-                ok += 1
-                print(f"  [{count}] ok ({note}): {url[:80]}")
+    with httpx.Client(timeout=config.FETCH_TIMEOUT, follow_redirects=True,
+                      headers={"User-Agent": config.USER_AGENT}) as client:
+        with open(out, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=TEXT_COLUMNS)
+            if new_file:
+                writer.writeheader()
+
+            def write_row(url, publish_date, source, loaded, text, note):
+                nonlocal count, ok
+                count += 1
+                writer.writerow({
+                    "Link": url,
+                    "Loaded": loaded,
+                    "Text": text if loaded else "",
+                    "publish_date": publish_date,
+                    "source": source,
+                })
+                f.flush()
+                if loaded:
+                    ok += 1
+                    print(f"  [{count}] ok ({note}): {url[:80]}")
+                else:
+                    print(f"  [{count}] FAILED ({note}): {url[:80]}")
+
+            if workers <= 1:
+                for url, publish_date, source in pending:
+                    loaded, text, note = fetch_text(url, client=client)
+                    write_row(url, publish_date, source, loaded, text, note)
             else:
-                print(f"  [{count}] FAILED ({note}): {url[:80]}")
+                jobs = [(url, client) for url, _, _ in pending]
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    for (url, loaded, text, note), (_, publish_date,
+                                                    source) in zip(
+                            pool.map(_fetch_one, jobs), pending):
+                        write_row(url, publish_date, source,
+                                  loaded, text, note)
     print(f"fetched {count} new links, {ok} with usable text")
     return count, ok
 
@@ -207,8 +265,12 @@ def main():
     parser.add_argument("--out", default=str(config.DATA_DIR / "texts.csv"))
     parser.add_argument("--limit", type=int, default=None,
                         help="cap the number of links fetched (smoke tests)")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="fetch N URLs concurrently (default 1, "
+                             "sequential; 8-16 is a good range for a big "
+                             "harvest -- output order is unchanged)")
     args = parser.parse_args()
-    fetch_all(args.links, args.out, limit=args.limit)
+    fetch_all(args.links, args.out, limit=args.limit, workers=args.workers)
 
 
 if __name__ == "__main__":

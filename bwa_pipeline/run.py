@@ -152,10 +152,12 @@ def bq(data_dir, since, until, backfill, limit, dry_run=False, slim=False):
         _merge_into_links(data_dir, out)
 
 
-def fetch(data_dir, limit):
+def fetch(data_dir, limit, workers=1):
     args = ["--links", data_dir / "links.csv", "--out", data_dir / "texts.csv"]
     if limit:
         args += ["--limit", limit]
+    if workers and workers != 1:
+        args += ["--workers", str(workers)]
     run_stage("fetch.py", *args)
 
 
@@ -175,11 +177,11 @@ def dedupe(data_dir):
 
 
 def full(data_dir, since, until, backfill, limit, sources=None,
-         retry_failed=False):
+         retry_failed=False, workers=1):
     stages = [
         ("discover", lambda: discover(data_dir, since, until, backfill, limit,
                                       sources, retry_failed)),
-        ("fetch", lambda: fetch(data_dir, limit)),
+        ("fetch", lambda: fetch(data_dir, limit, workers)),
         ("extract", lambda: extract(data_dir, limit)),
         ("dedupe", lambda: dedupe(data_dir)),
     ]
@@ -216,6 +218,9 @@ def main():
     common.add_argument("--dry-run", action="store_true",
                         help="bq stage only: report estimated BigQuery bytes "
                              "without executing anything")
+    common.add_argument("--workers", type=int, default=1,
+                        help="fetch stage only: fetch N URLs concurrently "
+                             "(default 1, sequential; 8-16 is a good range)")
     common.add_argument("--slim", action="store_true",
                         help="bq stage only: read only DATE + URL from BigQuery "
                              "and filter on the URL slug alone (far fewer bytes "
@@ -254,12 +259,12 @@ def main():
                            args.backfill, args.limit),
         "bq": lambda: bq(data_dir, args.since, args.until,
                          args.backfill, args.limit, args.dry_run, args.slim),
-        "fetch": lambda: fetch(data_dir, args.limit),
+        "fetch": lambda: fetch(data_dir, args.limit, args.workers),
         "extract": lambda: extract(data_dir, args.limit),
         "dedupe": lambda: dedupe(data_dir),
         "full": lambda: full(data_dir, args.since, args.until,
                              args.backfill, args.limit, args.sources,
-                             args.retry_failed),
+                             args.retry_failed, args.workers),
     }
     stages[args.stage]()
 
