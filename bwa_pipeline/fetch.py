@@ -24,6 +24,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 from urllib.robotparser import RobotFileParser
@@ -157,23 +158,59 @@ def _fetch_wayback(url):
     return resp.text, "wayback"
 
 
-def fetch_text(url, client=None):
+class _HostLimiter:
+    """Cap concurrent requests per host, plus a separate cap for Wayback.
+
+    With 50 workers and no per-host cap, one small newspaper could get 50
+    simultaneous hits. With this, each host sees at most `per_host`
+    concurrent requests (robots check + live fetch), while other hosts
+    proceed in parallel, and web.archive.org gets its own small cap
+    because every failed live fetch falls back to it. A worker never
+    holds two slots at once, so there is no deadlock risk.
+    """
+    def __init__(self, per_host=2, wayback=3):
+        self.per_host = per_host
+        self._lock = threading.Lock()
+        self._semaphores = {}
+        self._wayback_sem = threading.Semaphore(wayback)
+
+    def host_slot(self, host):
+        with self._lock:
+            sem = self._semaphores.get(host)
+            if sem is None:
+                sem = threading.Semaphore(self.per_host)
+                self._semaphores[host] = sem
+            return sem
+
+    def wayback_slot(self):
+        return self._wayback_sem
+
+
+def fetch_text(url, client=None, limiter=None):
     """Fetch and extract one article.
 
     Returns (loaded, text, note). loaded is False when nothing usable
     came back; note says why. client, if given, is a shared httpx.Client
-    reused across calls (and threads).
+    reused across calls (and threads). limiter, if given, is a
+    _HostLimiter capping concurrent requests per host (and to Wayback).
+    Text extraction runs outside the host slot, so a slow page parse
+    does not hold up the next request to the same site.
     """
-    if not _allowed(url):
-        return False, "", "blocked by robots.txt"
-    html, note = _fetch_live(url, client=client)
+    host = urlparse(url).netloc
+    host_sem = limiter.host_slot(host) if limiter else nullcontext()
+    with host_sem:
+        if not _allowed(url):
+            return False, "", "blocked by robots.txt"
+        html, note = _fetch_live(url, client=client)
     if html:
         text = _extract_text(html, url)
         if len(text) >= config.MIN_TEXT_CHARS:
             return True, text, "live"
         note = f"live text too short ({len(text)} chars)"
     print(f"  live fetch failed for {url} ({note}); trying Wayback")
-    html, wb_note = _fetch_wayback(url)
+    wb_sem = limiter.wayback_slot() if limiter else nullcontext()
+    with wb_sem:
+        html, wb_note = _fetch_wayback(url)
     if html:
         text = _extract_text(html, url)
         if len(text) >= config.MIN_TEXT_CHARS:
@@ -184,20 +221,25 @@ def fetch_text(url, client=None):
 
 def _fetch_one(args):
     """Worker for the thread pool: fetch one URL, never raise."""
-    url, client = args
+    url, client, limiter = args
     try:
-        loaded, text, note = fetch_text(url, client=client)
+        loaded, text, note = fetch_text(url, client=client, limiter=limiter)
     except Exception as e:
         return url, False, "", f"worker failed: {e}"
     return url, loaded, text if loaded else "", note
 
 
-def fetch_all(links_csv, out_csv, limit=None, workers=1):
+def fetch_all(links_csv, out_csv, limit=None, workers=1, per_host=2,
+              wayback_max=3):
     """Fetch every URL in links.csv, resuming past URLs already in out_csv.
 
     workers=1 is the original sequential loop. With workers=N, N URLs are
     fetched concurrently and rows are written in input order, so the output
-    file is identical to a sequential run (modulo timing).
+    file is identical to a sequential run (modulo timing). per_host caps
+    concurrent requests to any one website (default 2), so a big worker
+    pool still treats each site gently; wayback_max caps concurrent
+    requests to web.archive.org (default 3). Both only matter with
+    workers > 1.
     """
     links = pd.read_csv(links_csv, dtype=str).fillna("")
     done = set()
@@ -242,12 +284,15 @@ def fetch_all(links_csv, out_csv, limit=None, workers=1):
                 else:
                     print(f"  [{count}] FAILED ({note}): {url[:80]}")
 
+            limiter = (_HostLimiter(per_host=per_host,
+                                   wayback=wayback_max)
+                       if workers > 1 else None)
             if workers <= 1:
                 for url, publish_date, source in pending:
                     loaded, text, note = fetch_text(url, client=client)
                     write_row(url, publish_date, source, loaded, text, note)
             else:
-                jobs = [(url, client) for url, _, _ in pending]
+                jobs = [(url, client, limiter) for url, _, _ in pending]
                 with ThreadPoolExecutor(max_workers=workers) as pool:
                     for (url, loaded, text, note), (_, publish_date,
                                                     source) in zip(
@@ -269,8 +314,15 @@ def main():
                         help="fetch N URLs concurrently (default 1, "
                              "sequential; 8-16 is a good range for a big "
                              "harvest -- output order is unchanged)")
+    parser.add_argument("--per-host", type=int, default=2,
+                        help="max concurrent requests to one website "
+                             "(default 2; only matters with --workers > 1)")
+    parser.add_argument("--wayback-max", type=int, default=3,
+                        help="max concurrent requests to web.archive.org "
+                             "(default 3; only matters with --workers > 1)")
     args = parser.parse_args()
-    fetch_all(args.links, args.out, limit=args.limit, workers=args.workers)
+    fetch_all(args.links, args.out, limit=args.limit, workers=args.workers,
+              per_host=args.per_host, wayback_max=args.wayback_max)
 
 
 if __name__ == "__main__":

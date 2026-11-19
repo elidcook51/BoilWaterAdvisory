@@ -152,12 +152,16 @@ def bq(data_dir, since, until, backfill, limit, dry_run=False, slim=False):
         _merge_into_links(data_dir, out)
 
 
-def fetch(data_dir, limit, workers=1):
+def fetch(data_dir, limit, workers=1, per_host=2, wayback_max=3):
     args = ["--links", data_dir / "links.csv", "--out", data_dir / "texts.csv"]
     if limit:
         args += ["--limit", limit]
     if workers and workers != 1:
         args += ["--workers", str(workers)]
+    if per_host and per_host != 2:
+        args += ["--per-host", str(per_host)]
+    if wayback_max and wayback_max != 3:
+        args += ["--wayback-max", str(wayback_max)]
     run_stage("fetch.py", *args)
 
 
@@ -177,11 +181,12 @@ def dedupe(data_dir):
 
 
 def full(data_dir, since, until, backfill, limit, sources=None,
-         retry_failed=False, workers=1):
+         retry_failed=False, workers=1, per_host=2, wayback_max=3):
     stages = [
         ("discover", lambda: discover(data_dir, since, until, backfill, limit,
                                       sources, retry_failed)),
-        ("fetch", lambda: fetch(data_dir, limit, workers)),
+        ("fetch", lambda: fetch(data_dir, limit, workers, per_host,
+                                wayback_max)),
         ("extract", lambda: extract(data_dir, limit)),
         ("dedupe", lambda: dedupe(data_dir)),
     ]
@@ -221,6 +226,13 @@ def main():
     common.add_argument("--workers", type=int, default=1,
                         help="fetch stage only: fetch N URLs concurrently "
                              "(default 1, sequential; 8-16 is a good range)")
+    common.add_argument("--per-host", type=int, default=2,
+                        help="fetch stage only: max concurrent requests to "
+                             "one website (default 2; only with --workers)")
+    common.add_argument("--wayback-max", type=int, default=3,
+                        help="fetch stage only: max concurrent requests to "
+                             "web.archive.org (default 3; only with "
+                             "--workers)")
     common.add_argument("--slim", action="store_true",
                         help="bq stage only: read only DATE + URL from BigQuery "
                              "and filter on the URL slug alone (far fewer bytes "
@@ -259,12 +271,14 @@ def main():
                            args.backfill, args.limit),
         "bq": lambda: bq(data_dir, args.since, args.until,
                          args.backfill, args.limit, args.dry_run, args.slim),
-        "fetch": lambda: fetch(data_dir, args.limit, args.workers),
+        "fetch": lambda: fetch(data_dir, args.limit, args.workers,
+                               args.per_host, args.wayback_max),
         "extract": lambda: extract(data_dir, args.limit),
         "dedupe": lambda: dedupe(data_dir),
         "full": lambda: full(data_dir, args.since, args.until,
                              args.backfill, args.limit, args.sources,
-                             args.retry_failed, args.workers),
+                             args.retry_failed, args.workers,
+                             args.per_host, args.wayback_max),
     }
     stages[args.stage]()
 
