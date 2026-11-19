@@ -137,19 +137,39 @@ def _fetch_live(url, client=None):
     finally:
         if own_client:
             client.close()
+        else:
+            # Fresh state per URL, as with the old per-URL client:
+            # cookies a site set (Cloudflare, trackers) must not ride
+            # along into the next site's request. Only real httpx
+            # clients carry a cookie jar (test stubs do not).
+            if isinstance(client, httpx.Client):
+                client.cookies.clear()
     return None, "request failed"
 
 
 def _fetch_wayback(url):
-    """Archived copy via the Wayback CDX API. Returns (html, note)."""
-    try:
-        resp = httpx.get(WAYBACK_CDX, params={
-            "url": url, "output": "json",
-            "filter": "statuscode:200", "limit": 1,
-        }, timeout=20, follow_redirects=True)
-        data = resp.json()
-    except Exception as e:
-        return None, f"wayback lookup failed: {e}"
+    """Archived copy via the Wayback CDX API. Returns (html, note).
+
+    The CDX lookup is retried (3 attempts, 2s/4s backoff): a single
+    slow lookup used to be a permanent FAILED for the URL, and under
+    parallel load several lookups queue on archive.org at once, so a
+    transient 20s timeout is common enough to need a second chance.
+    Only the lookup is retried -- a real "no snapshot" answer is final.
+    """
+    data = None
+    for attempt, wait in enumerate([0, 2, 4]):
+        if wait:
+            time.sleep(wait)
+        try:
+            resp = httpx.get(WAYBACK_CDX, params={
+                "url": url, "output": "json",
+                "filter": "statuscode:200", "limit": 1,
+            }, timeout=20, follow_redirects=True)
+            data = resp.json()
+            break
+        except Exception as e:
+            if attempt == 2:
+                return None, f"wayback lookup failed: {e}"
     # First row is the header; rows after it are snapshots.
     if not isinstance(data, list) or len(data) < 2:
         return None, "no wayback snapshot"
@@ -187,6 +207,10 @@ class _HostLimiter:
     can reserve the same start time.
     """
     def __init__(self, per_host=2, wayback=3, host_delay=1.0, max_rate=10):
+        if per_host < 1:
+            raise ValueError("per_host must be >= 1")
+        if wayback < 1:
+            raise ValueError("wayback must be >= 1")
         self.per_host = per_host
         self.host_delay = host_delay
         self.global_interval = 1.0 / max_rate if max_rate else 0.0
@@ -197,17 +221,23 @@ class _HostLimiter:
         self._next_host = {}
 
     def wait_turn(self, host):
-        """Sleep until this request's reserved start time, if any."""
+        """Sleep until this request's reserved start time, if any.
+
+        Both clocks are reserved from the request's actual start time,
+        not from reservation time: with a deep global queue, reserving
+        from `now` let two same-host requests start the global
+        interval (0.1s) apart instead of `host_delay` (1.0s) apart.
+        """
         with self._lock:
             now = time.monotonic()
-            wait = 0.0
+            start = now
             if self.global_interval > 0:
-                wait = max(wait, self._next_global - now)
-                self._next_global = max(self._next_global, now) + self.global_interval
+                start = max(start, self._next_global)
+                self._next_global = start + self.global_interval
             if self.host_delay > 0:
-                nxt = self._next_host.get(host, 0.0)
-                wait = max(wait, nxt - now)
-                self._next_host[host] = max(nxt, now) + self.host_delay
+                start = max(start, self._next_host.get(host, 0.0))
+                self._next_host[host] = start + self.host_delay
+            wait = start - now
         if wait > 0:
             time.sleep(wait)
 
@@ -372,6 +402,10 @@ def main():
                              "(default 10; 0 for no cap; only matters with "
                              "--workers > 1)")
     args = parser.parse_args()
+    if args.per_host < 1:
+        parser.error("--per-host must be >= 1")
+    if args.wayback_max < 1:
+        parser.error("--wayback-max must be >= 1")
     fetch_all(args.links, args.out, limit=args.limit, workers=args.workers,
               per_host=args.per_host, wayback_max=args.wayback_max,
               host_delay=args.per_host_delay, max_rate=args.max_rate)
