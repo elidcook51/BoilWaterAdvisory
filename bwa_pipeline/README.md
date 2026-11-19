@@ -56,6 +56,31 @@ Add `--limit N` to any of these for a smoke test (for example,
 `python run.py fetch --limit 10` fetches at most 10 articles). Note that
 `--limit` is not used by `dedupe`.
 
+Before the LLM sees an article, the extract stage runs a cheap content
+gate on the fetched text: the text must mention boiling water, or a
+do-not-drink order about water. Articles that fail are logged to
+`data/extract_rejected.csv` and never cost an LLM call. This is what
+makes noisy discovery affordable — BigQuery `--slim` (URL slugs only)
+returns far more junk URLs, and the gate kills the water parks,
+drink-driving stories and waterfront listings for free. The LLM remains
+the real classifier: pages that pass the gate but are not advisories
+(e.g. recipes for boiling water) still come back all-null from the model.
+Pass `--no-gate` to `extract.py` to disable the gate.
+
+To validate the gate on a harvested set without spending anything on
+the LLM, run `extract.py --gate-only`: it applies only the gate and
+writes `gate_passed[_suffix].csv` and `gate_rejected[_suffix].csv` next
+to the output (the suffix comes from the texts filename), with no API
+key needed and no `structured.csv` written. For example, to check the
+gate on the full and slim one-day sets side by side:
+
+```bash
+python fetch.py --links data/links_full.csv --out data/texts_full.csv
+python fetch.py --links data/links_slim.csv --out data/texts_slim.csv
+python extract.py --texts data/texts_full.csv --out data/structured_full.csv --gate-only
+python extract.py --texts data/texts_slim.csv --out data/structured_slim.csv --gate-only
+```
+
 ## Running the full pipeline
 
 ```bash
@@ -146,7 +171,31 @@ without downloading anything. Needs `BQ_KEY_FILE` in `.env` (a Google
 Cloud service-account JSON key with the BigQuery User role; the public
 dataset itself is free to read). It queries month by month, selecting only
 the four columns it needs, US articles only by default, with a per-chunk
-bytes cap. **Always dry-run first** — it prints the estimated bytes per
+bytes cap. The filter is themes plus a water/drink/boil word in the
+article URL itself (an explicit boil-water slug bypasses the theme check):
+themes and locations alone are far too loose — a live one-day run matched
+20/20 junk rows on themes alone. Expect roughly 1 in 10 matches to be a
+real advisory; the LLM extraction stage rejects the rest.
+
+`--slim` reads only DATE + DocumentIdentifier and filters on the URL slug
+alone (no themes, no US filter), so a month scans far less — measure it
+with `--dry-run --slim` on one month before committing a backfill to it.
+Measured June 2024: 1.4 GB slim vs 17.8 GB full, and slim returned 1,623
+candidate URLs for the day vs 312 full — a strict superset, so it loses
+nothing the full filter finds.
+
+Two refinements (v2.3, measured on the 2024-06-03 one-day run): slug
+words match the URL path only, not the domain (towns and papers named
+Bridgewater / Clearwater / Waterford matched on the host alone), and URLs
+containing "waters" without "boil" are excluded (41 of 312 full-filter
+rows that day were Maxine Waters stories). Together they cut that day's
+full set from 312 to 255 and the slim set from 1,623 to 1,394, dropping
+no boil-water URL.
+It returns many more junk URLs, which is only affordable because the
+extract stage's content gate (below) rejects them from the fetched text
+before any LLM call is spent. In slim mode `source_name` is the domain
+taken from the URL, and `query` records which slug word matched
+(`bq:slug-boil`, `bq:slug-water`, `bq:slug-drink`). **Always dry-run first** — it prints the estimated bytes per
 month before anything executes:
 
 ```bash

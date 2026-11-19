@@ -25,11 +25,23 @@ Table and schema, verified 2026-11-18 against:
 What the filter can and cannot do: GKG is metadata, not full text, so
 there is no exact-phrase search like the DOC API's "boil water advisory".
 Rows match when V2Themes contains WATER, DRINKING, SANITATION, or
-CONTAMINAT. That is deliberately recall-first: the downstream fetch and
-LLM extraction stages reject the non-advisories. By default rows are also
-restricted to US-located articles (V2Locations mentions "United States");
-pass --no-us-only to drop that filter. GKG carries no title, so the title
-column is left empty.
+CONTAMINAT. Themes and locations alone are NOT enough: GDELT assigns water
+themes to unrelated stories, and V2Locations lists every place an article
+mentions, not where it was published — a live one-day run on 2024-06-03
+matched 20/20 junk rows (foreign politics, orange-juice prices) on themes
+alone. So a row must also have water, drink, or boil in the article URL
+itself, unless the URL carries an explicit boil-water slug (which bypasses
+the theme/location checks). Two refinements (v2.3, measured on the
+2024-06-03 one-day run): slug words match the URL path only, not the
+domain (Bridgewater / Clearwater / Waterford papers matched on the host
+alone), and URLs containing "waters" without "boil" are excluded (41 of
+312 full-filter rows that day were Maxine Waters stories). That is
+deliberately recall-first: the
+downstream fetch and LLM extraction stages reject the non-advisories, and
+roughly 1 in 10 matches is expected to be a real advisory (same as the
+bulk GKG harvester). By default rows are also restricted to US-located
+articles (V2Locations mentions "United States"); pass --no-us-only to
+drop that filter. GKG carries no title, so the title column is left empty.
 
 COST — read this before running. BigQuery bills by bytes scanned, not by
 rows matched, and the free tier is 1 TB/month. The query selects only the
@@ -40,6 +52,12 @@ therefore roughly 4-7 TB scanned, which exceeds the free tier if done in
 one billing month. Two rules follow:
 - ALWAYS run --dry-run first. It reports the estimated bytes per chunk
   without executing anything, so you see the bill before spending it.
+- --slim reads only DATE + DocumentIdentifier and filters on the URL slug
+  alone, so a month scans far less (measure it: --dry-run --slim on one
+  month). It drops the theme and US filters, so it returns many more junk
+  URLs; only use it with the extract stage's content gate on (the
+  default), which rejects the junk from the fetched text before any LLM
+  call is spent.
 - Then validate with one small chunk: --chunk-days 1 --limit 20 on a
   single day. Note --limit caps rows written, NOT bytes scanned; a
   --limit 20 run over a month still scans the whole month.
@@ -111,7 +129,7 @@ def _matched_pattern(themes):
     return None
 
 
-def build_sql(chunk_start, chunk_end, us_only=True):
+def build_sql(chunk_start, chunk_end, us_only=True, slim=False):
     """SQL for one chunk, plus the partition window it prunes to.
 
     The _PARTITIONTIME window is padded a day on each side because it is
@@ -122,17 +140,60 @@ def build_sql(chunk_start, chunk_end, us_only=True):
     """
     part_start = chunk_start - timedelta(days=1)
     part_end = chunk_end + timedelta(days=2)
+    # Slug words match the URL path only (after the host), not the domain:
+    # a town or paper named Bridgewater / Clearwater / Waterford must not
+    # match on the host alone (121 junk rows in one slim day, 2024-06-03).
+    # And "waters" without "boil" is almost always a person's name (41 of
+    # the 312 full-filter rows that day were Maxine Waters stories); a real
+    # advisory URL says "boil", so that case is preserved. Neither tweak
+    # changes the columns read, so the dry-run byte estimate is unaffected.
+    slug_clause = " OR ".join(
+        f"REGEXP_CONTAINS(LOWER(DocumentIdentifier), "
+        f"r'://[^/]*/.*{w}')" for w in ("water", "drink", "boil"))
+    waters_exclusion = (
+        " AND NOT (LOWER(DocumentIdentifier) LIKE '%waters%'"
+        " AND LOWER(DocumentIdentifier) NOT LIKE '%boil%')")
+    if slim:
+        # Slim mode: read only the two narrow columns (DATE + URL) and
+        # filter on the URL slug alone. No themes, no locations, so the
+        # scan is far smaller — but there is no theme/US filtering, and
+        # the URL-only filter is much noisier. It only makes sense with
+        # the extract stage's content gate on (the default), which kills
+        # the junk from the fetched text before any LLM call is spent.
+        # Measure it first: --dry-run --slim on one month and compare
+        # with the full query before committing a backfill to it.
+        sql = f"""SELECT DATE, DocumentIdentifier
+FROM `{TABLE}`
+WHERE _PARTITIONTIME >= TIMESTAMP('{part_start.isoformat()}')
+  AND _PARTITIONTIME < TIMESTAMP('{part_end.isoformat()}')
+  AND DATE >= {_date_int(chunk_start)}
+  AND DATE < {_date_int(chunk_end + timedelta(days=1))}
+  AND SourceCollectionIdentifier = 1
+  AND ({slug_clause}){waters_exclusion}"""
+        return sql
     theme_clause = " OR ".join(
         f"V2Themes LIKE '%{p}%'" for p in THEME_PATTERNS)
-    us_clause = "\n  AND V2Locations LIKE '%United States%'" if us_only else ""
+    # Themes and locations alone are far too loose: GDELT assigns water
+    # themes to unrelated stories, and V2Locations lists every place an
+    # article mentions, not where it was published. So, mirroring gkg.py,
+    # a row must also have water/drink/boil in the article URL itself,
+    # unless the URL carries an explicit boil-water slug (which bypasses
+    # the theme/location checks). A live one-day run on 2024-06-03
+    # returned 20/20 junk rows without this condition.
+    bypass_clause = " OR ".join(
+        f"LOWER(DocumentIdentifier) LIKE '%{w}%'" for w in
+        ("boil-water", "boilwater", "boil_water"))
+    us_clause = ("\n  AND V2Locations LIKE '%United States%'"
+                 if us_only else "")
     sql = f"""SELECT DATE, DocumentIdentifier, SourceCommonName, V2Themes
 FROM `{TABLE}`
 WHERE _PARTITIONTIME >= TIMESTAMP('{part_start.isoformat()}')
   AND _PARTITIONTIME < TIMESTAMP('{part_end.isoformat()}')
   AND DATE >= {_date_int(chunk_start)}
   AND DATE < {_date_int(chunk_end + timedelta(days=1))}
-  AND SourceCollectionIdentifier = 1{us_clause}
-  AND ({theme_clause})"""
+  AND SourceCollectionIdentifier = 1
+  AND ((({theme_clause}){us_clause} AND ({slug_clause}))
+       OR ({bypass_clause})){waters_exclusion}"""
     return sql
 
 
@@ -188,7 +249,22 @@ def _chunks(since, until, chunk_days):
         chunk_start = chunk_end + timedelta(days=1)
 
 
-def _rows_to_links(rows, seen):
+def _slug_word(url):
+    """Which URL-slug word matched, most specific first (for the query field)."""
+    low = url.lower()
+    for word in ("boil", "water", "drink"):
+        if word in low:
+            return word
+    return None
+
+
+def _domain_of(url):
+    from urllib.parse import urlparse
+    host = urlparse(url).netloc.lower()
+    return host[4:] if host.startswith("www.") else host
+
+
+def _rows_to_links(rows, seen, slim=False):
     """Turn BigQuery rows into links.csv dicts, skipping bad rows."""
     links = []
     for row in rows:
@@ -198,7 +274,11 @@ def _rows_to_links(rows, seen):
         publish_date = _parse_gkg_date(row.get("DATE"))
         if publish_date is None:
             continue
-        pattern = _matched_pattern(row.get("V2Themes"))
+        if slim:
+            word = _slug_word(url)
+            pattern = ("slug-" + word) if word else None
+        else:
+            pattern = _matched_pattern(row.get("V2Themes"))
         if pattern is None:
             continue
         canon = canonicalize_url(url)
@@ -208,7 +288,8 @@ def _rows_to_links(rows, seen):
         links.append({
             "url": canon,
             "source": "gdelt_bq",
-            "source_name": row.get("SourceCommonName") or "",
+            "source_name": (_domain_of(url) if slim
+                            else (row.get("SourceCommonName") or "")),
             "publish_date": publish_date.isoformat(),
             "capture_date": _today(),
             "title": "",
@@ -227,7 +308,7 @@ def _write_links(out_path, links):
 
 
 def discover_bq(out, since=None, until=None, limit=None, dry_run=False,
-                 chunk_days=31, us_only=True,
+                 chunk_days=31, us_only=True, slim=False,
                  max_bytes_billed=DEFAULT_MAX_BYTES_BILLED):
     """Query GKG month by month (or chunk_days at a time) into links.csv.
 
@@ -257,7 +338,7 @@ def discover_bq(out, since=None, until=None, limit=None, dry_run=False,
         if chunk_start.isoformat() in done:
             print(f"  bq {label}: already done; skipped")
             continue
-        sql = build_sql(chunk_start, chunk_end, us_only=us_only)
+        sql = build_sql(chunk_start, chunk_end, us_only=us_only, slim=slim)
         if dry_run:
             job_config = bigquery.QueryJobConfig(
                 dry_run=True, use_query_cache=False)
@@ -286,7 +367,7 @@ def discover_bq(out, since=None, until=None, limit=None, dry_run=False,
                   f"{WARN_BYTES / 1e9:.0f} GB scanned "
                   f"({bytes_total / 1e9:.1f} GB so far)")
             warned = True
-        links = _rows_to_links(rows, seen)
+        links = _rows_to_links(rows, seen, slim=slim)
         truncated = False
         if limit is not None:
             remaining = max(0, limit - written)
@@ -338,12 +419,19 @@ def main():
     parser.add_argument("--no-us-only", action="store_true",
                         help="drop the US-locations filter (global water "
                              "news; much noisier)")
+    parser.add_argument("--slim", action="store_true",
+                        help="read only DATE + DocumentIdentifier and filter "
+                             "on the URL slug alone (no themes, no US filter): "
+                             "far fewer bytes scanned, but many more junk "
+                             "URLs — only use it with the extract stage's "
+                             "content gate on (the default). Measure first: "
+                             "--dry-run --slim on one month")
     args = parser.parse_args()
 
     written, bytes_total, failed = discover_bq(
         args.out, since=args.since, until=args.until, limit=args.limit,
         dry_run=args.dry_run, chunk_days=args.chunk_days,
-        us_only=not args.no_us_only,
+        us_only=not args.no_us_only, slim=args.slim,
         max_bytes_billed=args.max_bytes_billed)
     if args.dry_run:
         print(f"dry-run total estimate: {bytes_total / 1e9:.1f} GB")

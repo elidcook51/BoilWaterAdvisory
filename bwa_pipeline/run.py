@@ -123,7 +123,7 @@ def gkg(data_dir, since, until, backfill, limit):
     _merge_into_links(data_dir, out)
 
 
-def bq(data_dir, since, until, backfill, limit, dry_run=False):
+def bq(data_dir, since, until, backfill, limit, dry_run=False, slim=False):
     """Harvest links from GDELT's GKG table in BigQuery, merge into links.csv."""
     data_dir.mkdir(parents=True, exist_ok=True)
     out = data_dir / "links_bq.csv"
@@ -136,6 +136,8 @@ def bq(data_dir, since, until, backfill, limit, dry_run=False):
                 args += ["--limit", limit]
             if dry_run:
                 args += ["--dry-run"]
+            if slim:
+                args += ["--slim"]
             run_stage("bq.py", *args)
     else:
         args = ["--out", out, "--since", since, "--until", until]
@@ -143,6 +145,8 @@ def bq(data_dir, since, until, backfill, limit, dry_run=False):
             args += ["--limit", limit]
         if dry_run:
             args += ["--dry-run"]
+        if slim:
+            args += ["--slim"]
         run_stage("bq.py", *args)
     if not dry_run:
         _merge_into_links(data_dir, out)
@@ -212,6 +216,11 @@ def main():
     common.add_argument("--dry-run", action="store_true",
                         help="bq stage only: report estimated BigQuery bytes "
                              "without executing anything")
+    common.add_argument("--slim", action="store_true",
+                        help="bq stage only: read only DATE + URL from BigQuery "
+                             "and filter on the URL slug alone (far fewer bytes "
+                             "scanned; noisier links, screened later by the "
+                             "extract content gate)")
 
     parser = argparse.ArgumentParser(
         description="Run the boil water advisory pipeline, one stage or all of it.",
@@ -244,7 +253,7 @@ def main():
         "gkg": lambda: gkg(data_dir, args.since, args.until,
                            args.backfill, args.limit),
         "bq": lambda: bq(data_dir, args.since, args.until,
-                         args.backfill, args.limit, args.dry_run),
+                         args.backfill, args.limit, args.dry_run, args.slim),
         "fetch": lambda: fetch(data_dir, args.limit),
         "extract": lambda: extract(data_dir, args.limit),
         "dedupe": lambda: dedupe(data_dir),

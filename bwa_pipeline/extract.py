@@ -4,9 +4,26 @@ Reads texts.csv (Link, Loaded, Text, publish_date, source), sends each
 loaded article to the LLM once, and appends one flattened row per article
 to structured.csv. Re-runs are safe: URLs already in the output file are
 skipped, so a crashed or interrupted run picks up where it left off.
+
+Before any LLM call, a cheap content gate screens the fetched text: it
+must read like a water advisory (it mentions boiling water, or a
+do-not-drink order about water). Articles that fail the gate are logged
+to extract_rejected.csv and never reach the LLM, which is what makes
+noisy discovery (e.g. BigQuery --slim, URL-slug only) affordable: the
+gate kills water parks, drink-driving and waterfront junk for free, and
+the LLM only sees plausible advisories. Pass --no-gate to disable it.
+
+--gate-only runs the gate with no LLM calls at all (and no API key
+needed): it reads texts.csv, writes the URLs that pass to
+gate_passed[_suffix].csv and the ones that fail to
+gate_rejected[_suffix].csv next to the output (the suffix comes from the
+texts filename, e.g. texts_full.csv -> gate_passed_full.csv), and writes
+no structured.csv. Use it to validate the gate on a harvested set before
+spending anything on extraction.
 """
 
 import argparse
+import csv
 import json
 import re
 import sys
@@ -204,6 +221,25 @@ def extract_advisory(client, article_text, publish_date=None, source_url=None,
     return data
 
 
+def passes_content_gate(text):
+    """Cheap pre-LLM screen: does this fetched text read like a water advisory?
+
+    Passes when the text mentions boiling water, or a do-not-drink order
+    about water. This kills the bulk of the junk that URL-slug discovery
+    returns (water parks, drink-driving, waterfront property) before any
+    LLM call is spent. The LLM remains the real classifier: passing the
+    gate only buys the article an LLM call, and pages that pass it but
+    are not advisories (e.g. recipes for boiling water) still come back
+    all-null from the model.
+    """
+    low = (text or "").lower()
+    if "boil" in low and "water" in low:
+        return True
+    if "do not drink" in low and "water" in low:
+        return True
+    return False
+
+
 def _is_loaded(value):
     if isinstance(value, bool):
         return value
@@ -219,16 +255,53 @@ def _clean_date(value):
     return text or None
 
 
-def extract_all(texts_csv, out_csv, limit=None):
+def _gate_log_paths(texts_csv, out_dir):
+    """Pass/reject log paths for --gate-only, named after the texts file."""
+    stem = Path(texts_csv).stem
+    suffix = stem[len("texts"):] if stem.startswith("texts") else ""
+    return (out_dir / f"gate_passed{suffix}.csv",
+            out_dir / f"gate_rejected{suffix}.csv")
+
+
+def _log_passed(passed_path, url, publish_date):
+    header = (not passed_path.exists()
+              or passed_path.stat().st_size == 0)
+    with open(passed_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["url", "publish_date"])
+        if header:
+            writer.writeheader()
+        writer.writerow({"url": url, "publish_date": publish_date or ""})
+
+
+def _log_rejected(rejected_path, url):
+    header = (not rejected_path.exists()
+              or rejected_path.stat().st_size == 0)
+    with open(rejected_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["url", "reason"])
+        if header:
+            writer.writeheader()
+        writer.writerow({"url": url,
+                         "reason": "no boil-water keywords in text"})
+
+
+def extract_all(texts_csv, out_csv, limit=None, gate=True, gate_only=False):
     """Run extraction over texts.csv and append structured rows to out_csv.
 
-    Returns the number of advisories extracted in this run.
+    Returns the number of advisories extracted in this run. With the
+    content gate on (default), articles whose fetched text does not read
+    like a water advisory are logged to extract_rejected.csv next to the
+    output and never sent to the LLM. With gate_only=True, no LLM call is
+    made at all (and no API key is needed): gate-passing URLs go to
+    gate_passed[_suffix].csv, failures to gate_rejected[_suffix].csv, and
+    the return value is the number that passed.
     """
-    if not config.OPEN_AI_API_KEY:
+    if gate_only:
+        gate = True
+    if not gate_only and not config.OPEN_AI_API_KEY:
         sys.exit("OPEN_AI_API_KEY is not set. Add it to a .env file at the repo head:\n"
                  "    OPEN_AI_API_KEY=sk-...")
 
-    client = OpenAI(api_key=config.OPEN_AI_API_KEY)
+    client = None if gate_only else OpenAI(api_key=config.OPEN_AI_API_KEY)
 
     out_path = Path(out_csv)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -239,6 +312,26 @@ def extract_all(texts_csv, out_csv, limit=None):
     if limit:
         texts = texts.head(limit)
     texts = texts.reset_index(drop=True)
+
+    if gate_only:
+        passed_path, rejected_path = _gate_log_paths(texts_csv, out_path.parent)
+    else:
+        passed_path = None
+        rejected_path = out_path.parent / "extract_rejected.csv"
+    rejected = set()
+    if rejected_path.exists():
+        try:
+            with open(rejected_path, newline="", encoding="utf-8") as f:
+                rejected = {r.get("url", "") for r in csv.DictReader(f)}
+        except OSError:
+            rejected = set()
+    passed = set()
+    if gate_only and passed_path.exists():
+        try:
+            with open(passed_path, newline="", encoding="utf-8") as f:
+                passed = {r.get("url", "") for r in csv.DictReader(f)}
+        except OSError:
+            passed = set()
 
     done = set()
     columns = None
@@ -253,9 +346,23 @@ def extract_all(texts_csv, out_csv, limit=None):
 
     total = len(texts)
     processed = 0
+    gated = 0
+    passed_n = 0
     for idx, row in texts.iterrows():
         link = str(row["Link"]).strip()
-        if link in done:
+        if link in done or link in rejected or link in passed:
+            continue
+        if gate and not passes_content_gate(str(row["Text"])):
+            _log_rejected(rejected_path, link)
+            rejected.add(link)
+            gated += 1
+            print(f"Gated out row {idx} ({link}): no boil-water keywords")
+            continue
+        if gate_only:
+            _log_passed(passed_path, link,
+                        _clean_date(row.get("publish_date")))
+            passed.add(link)
+            passed_n += 1
             continue
         try:
             record = extract_advisory(
@@ -280,12 +387,18 @@ def extract_all(texts_csv, out_csv, limit=None):
         processed += 1
         print(f"Finished row {idx} ({processed}/{total} done this run)")
 
+    if gate_only:
+        print(f"Gate-only: {passed_n} passed, {gated} gated out "
+              f"(no LLM calls made)")
+        return passed_n
+
     if processed == 0 and (not out_path.exists()
                           or out_path.stat().st_size == 0):
         pd.DataFrame(columns=columns or _empty_columns()).to_csv(
             out_path, index=False)
         print(f"Wrote header-only {out_path} (no advisories extracted)")
-    print(f"Processed {processed} advisories")
+    print(f"Processed {processed} advisories"
+          + (f" ({gated} gated out by the content gate)" if gated else ""))
     return processed
 
 
@@ -298,8 +411,20 @@ def main():
                         help="output structured.csv (appended to; resume-safe)")
     parser.add_argument("--limit", type=int, default=None,
                         help="only process the first N loaded articles (smoke test)")
+    parser.add_argument("--no-gate", action="store_true",
+                        help="disable the pre-LLM content gate: send every "
+                             "loaded article to the LLM (costs more on noisy "
+                             "discovery; useful if the gate is ever suspected "
+                             "of dropping real advisories)")
+    parser.add_argument("--gate-only", action="store_true",
+                        help="run only the content gate, with no LLM calls "
+                             "and no API key: write gate_passed[_suffix].csv "
+                             "and gate_rejected[_suffix].csv next to the "
+                             "output (suffix from the texts filename) and "
+                             "write no structured.csv")
     args = parser.parse_args()
-    extract_all(args.texts, args.out, limit=args.limit)
+    extract_all(args.texts, args.out, limit=args.limit,
+                gate=not args.no_gate, gate_only=args.gate_only)
 
 
 if __name__ == "__main__":
