@@ -116,6 +116,15 @@ def _fetch_live(url, client=None):
                     continue
                 return None, f"request failed: {e}"
             if resp.status_code == 429 and i < len(waits) - 1:
+                # The site is explicitly asking us to slow down: honour
+                # its Retry-After (capped at 30s) instead of hammering
+                # again after 1s, which just earns another 429.
+                retry_after = resp.headers.get("retry-after")
+                if retry_after:
+                    try:
+                        time.sleep(min(float(retry_after), 30))
+                    except ValueError:
+                        pass
                 continue
             if resp.status_code >= 500 and i < len(waits) - 1:
                 continue
@@ -167,12 +176,40 @@ class _HostLimiter:
     proceed in parallel, and web.archive.org gets its own small cap
     because every failed live fetch falls back to it. A worker never
     holds two slots at once, so there is no deadlock risk.
+
+    Concurrency caps alone do not limit request RATE: two-at-a-time with
+    fast responses still hits one host 10 times in a few seconds, and a
+    75-worker burst hits 75 hosts at once from one IP -- both trip
+    rate limiters. So the limiter also smooths request starts: at most
+    `max_rate` requests per second overall, and at least `host_delay`
+    seconds between two requests to the same host. Either is 0 to turn
+    that floor off. Slots are reserved under one lock, so no two threads
+    can reserve the same start time.
     """
-    def __init__(self, per_host=2, wayback=3):
+    def __init__(self, per_host=2, wayback=3, host_delay=1.0, max_rate=10):
         self.per_host = per_host
+        self.host_delay = host_delay
+        self.global_interval = 1.0 / max_rate if max_rate else 0.0
         self._lock = threading.Lock()
         self._semaphores = {}
         self._wayback_sem = threading.Semaphore(wayback)
+        self._next_global = 0.0
+        self._next_host = {}
+
+    def wait_turn(self, host):
+        """Sleep until this request's reserved start time, if any."""
+        with self._lock:
+            now = time.monotonic()
+            wait = 0.0
+            if self.global_interval > 0:
+                wait = max(wait, self._next_global - now)
+                self._next_global = max(self._next_global, now) + self.global_interval
+            if self.host_delay > 0:
+                nxt = self._next_host.get(host, 0.0)
+                wait = max(wait, nxt - now)
+                self._next_host[host] = max(nxt, now) + self.host_delay
+        if wait > 0:
+            time.sleep(wait)
 
     def host_slot(self, host):
         with self._lock:
@@ -197,6 +234,8 @@ def fetch_text(url, client=None, limiter=None):
     does not hold up the next request to the same site.
     """
     host = urlparse(url).netloc
+    if limiter:
+        limiter.wait_turn(host)
     host_sem = limiter.host_slot(host) if limiter else nullcontext()
     with host_sem:
         if not _allowed(url):
@@ -230,16 +269,18 @@ def _fetch_one(args):
 
 
 def fetch_all(links_csv, out_csv, limit=None, workers=1, per_host=2,
-              wayback_max=3):
+              wayback_max=3, host_delay=1.0, max_rate=10):
     """Fetch every URL in links.csv, resuming past URLs already in out_csv.
 
     workers=1 is the original sequential loop. With workers=N, N URLs are
     fetched concurrently and rows are written in input order, so the output
     file is identical to a sequential run (modulo timing). per_host caps
-    concurrent requests to any one website (default 2), so a big worker
-    pool still treats each site gently; wayback_max caps concurrent
-    requests to web.archive.org (default 3). Both only matter with
-    workers > 1.
+    concurrent requests to any one website (default 2); wayback_max caps
+    concurrent requests to web.archive.org (default 3); host_delay is the
+    minimum gap in seconds between two requests to the same website
+    (default 1.0); max_rate caps total requests per second across all
+    websites (default 10, 0 for no cap). The rate floors only matter
+    with workers > 1.
     """
     links = pd.read_csv(links_csv, dtype=str).fillna("")
     done = set()
@@ -285,7 +326,9 @@ def fetch_all(links_csv, out_csv, limit=None, workers=1, per_host=2,
                     print(f"  [{count}] FAILED ({note}): {url[:80]}")
 
             limiter = (_HostLimiter(per_host=per_host,
-                                   wayback=wayback_max)
+                                   wayback=wayback_max,
+                                   host_delay=host_delay,
+                                   max_rate=max_rate)
                        if workers > 1 else None)
             if workers <= 1:
                 for url, publish_date, source in pending:
@@ -320,9 +363,18 @@ def main():
     parser.add_argument("--wayback-max", type=int, default=3,
                         help="max concurrent requests to web.archive.org "
                              "(default 3; only matters with --workers > 1)")
+    parser.add_argument("--per-host-delay", type=float, default=1.0,
+                        help="minimum seconds between two requests to the "
+                             "same website (default 1.0; 0 for none; only "
+                             "matters with --workers > 1)")
+    parser.add_argument("--max-rate", type=float, default=10,
+                        help="max requests per second across all websites "
+                             "(default 10; 0 for no cap; only matters with "
+                             "--workers > 1)")
     args = parser.parse_args()
     fetch_all(args.links, args.out, limit=args.limit, workers=args.workers,
-              per_host=args.per_host, wayback_max=args.wayback_max)
+              per_host=args.per_host, wayback_max=args.wayback_max,
+              host_delay=args.per_host_delay, max_rate=args.max_rate)
 
 
 if __name__ == "__main__":

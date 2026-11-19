@@ -152,7 +152,8 @@ def bq(data_dir, since, until, backfill, limit, dry_run=False, slim=False):
         _merge_into_links(data_dir, out)
 
 
-def fetch(data_dir, limit, workers=1, per_host=2, wayback_max=3):
+def fetch(data_dir, limit, workers=1, per_host=2, wayback_max=3,
+          host_delay=1.0, max_rate=10):
     args = ["--links", data_dir / "links.csv", "--out", data_dir / "texts.csv"]
     if limit:
         args += ["--limit", limit]
@@ -162,6 +163,10 @@ def fetch(data_dir, limit, workers=1, per_host=2, wayback_max=3):
         args += ["--per-host", str(per_host)]
     if wayback_max and wayback_max != 3:
         args += ["--wayback-max", str(wayback_max)]
+    if host_delay is not None and host_delay != 1.0:
+        args += ["--per-host-delay", str(host_delay)]
+    if max_rate is not None and max_rate != 10:
+        args += ["--max-rate", str(max_rate)]
     run_stage("fetch.py", *args)
 
 
@@ -181,12 +186,13 @@ def dedupe(data_dir):
 
 
 def full(data_dir, since, until, backfill, limit, sources=None,
-         retry_failed=False, workers=1, per_host=2, wayback_max=3):
+         retry_failed=False, workers=1, per_host=2, wayback_max=3,
+         host_delay=1.0, max_rate=10):
     stages = [
         ("discover", lambda: discover(data_dir, since, until, backfill, limit,
                                       sources, retry_failed)),
         ("fetch", lambda: fetch(data_dir, limit, workers, per_host,
-                                wayback_max)),
+                                wayback_max, host_delay, max_rate)),
         ("extract", lambda: extract(data_dir, limit)),
         ("dedupe", lambda: dedupe(data_dir)),
     ]
@@ -233,6 +239,14 @@ def main():
                         help="fetch stage only: max concurrent requests to "
                              "web.archive.org (default 3; only with "
                              "--workers)")
+    common.add_argument("--per-host-delay", type=float, default=1.0,
+                        help="fetch stage only: minimum seconds between two "
+                             "requests to the same website (default 1.0; "
+                             "only with --workers)")
+    common.add_argument("--max-rate", type=float, default=10,
+                        help="fetch stage only: max requests per second "
+                             "across all websites (default 10; 0 for no "
+                             "cap; only with --workers)")
     common.add_argument("--slim", action="store_true",
                         help="bq stage only: read only DATE + URL from BigQuery "
                              "and filter on the URL slug alone (far fewer bytes "
@@ -272,13 +286,15 @@ def main():
         "bq": lambda: bq(data_dir, args.since, args.until,
                          args.backfill, args.limit, args.dry_run, args.slim),
         "fetch": lambda: fetch(data_dir, args.limit, args.workers,
-                               args.per_host, args.wayback_max),
+                               args.per_host, args.wayback_max,
+                               args.per_host_delay, args.max_rate),
         "extract": lambda: extract(data_dir, args.limit),
         "dedupe": lambda: dedupe(data_dir),
         "full": lambda: full(data_dir, args.since, args.until,
                              args.backfill, args.limit, args.sources,
                              args.retry_failed, args.workers,
-                             args.per_host, args.wayback_max),
+                             args.per_host, args.wayback_max,
+                             args.per_host_delay, args.max_rate),
     }
     stages[args.stage]()
 
