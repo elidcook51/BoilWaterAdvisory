@@ -4,3 +4,5 @@ bwa_crawler
 *.csv
 *__pycache__
 *.json
+*.done
+*.db
