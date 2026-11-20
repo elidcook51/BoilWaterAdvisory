@@ -1,8 +1,10 @@
-"""Full-runner for the boil water advisory pipeline.
+"""Full-runner for the boil water advisory pipeline (v4).
 
 Run one stage on its own or the whole pipeline:
     python run.py discover
+    python run.py prune
     python run.py fetch
+    python run.py archive
     python run.py extract
     python run.py dedupe
     python run.py full
@@ -11,6 +13,13 @@ Harvesters that bypass the rate-limited GDELT DOC API (their rows are
 merged into links.csv, so the rest of the pipeline is unchanged):
     python run.py gkg      # GDELT bulk GKG files, 2015-02-18 onward
     python run.py bq       # GDELT GKG table in BigQuery (needs BQ_KEY_FILE)
+
+v4 stage order: prune (S1 URL-only rules) -> fetch (live only) ->
+archive (Wayback, separate long job) -> extract (content gate + LLM)
+-> dedupe. `full` runs discover, prune, fetch, extract, dedupe; the
+archive pass is NOT in `full`, because it is a weeks-long job over
+the deferred rows that must be run from an egress that can reach
+archive.org -- run it separately, during or after the live pass.
 
 Each stage is its own script, run as a subprocess, so it can also be run
 directly (for example: python extract.py --texts data/texts.csv
@@ -152,29 +161,71 @@ def bq(data_dir, since, until, backfill, limit, dry_run=False, slim=False):
         _merge_into_links(data_dir, out)
 
 
-def fetch(data_dir, limit, workers=1, per_host=2, wayback_max=3,
+def prune(data_dir):
+    """Prune links.csv with the S1 URL-only rules, in place.
+
+    Writes links_pruned.csv next to links.csv and replaces links.csv
+    with it (same columns, same order, fewer rows). Prune a copy, or
+    the next harvest's file -- never a file a fetch is reading.
+    """
+    data_dir.mkdir(parents=True, exist_ok=True)
+    links = data_dir / "links.csv"
+    pruned = data_dir / "links_pruned.csv"
+    run_stage("prune.py", links, "--out", pruned)
+    pruned.replace(links)
+    print(f"Pruned links are now {links}")
+
+
+def fetch(data_dir, limit, workers=20, per_host=2, wayback_max=3,
           host_delay=1.0, max_rate=20, curl_cffi=True, chunk_size=2000,
-          retry_failed=False):
+          retry_failed=False, read_timeout=None):
+    """Live-only fetch (v4 Stage 1). No Wayback call happens here.
+
+    wayback_max and chunk_size are accepted for call compatibility
+    with v3 and ignored: v4 has no Wayback traffic in the live pass
+    and no chunked writes.
+    """
     args = ["--links", data_dir / "links.csv", "--out", data_dir / "texts.csv"]
     if limit:
         args += ["--limit", limit]
-    if workers and workers != 1:
+    if workers and workers != 20:
         args += ["--workers", str(workers)]
     if per_host and per_host != 2:
         args += ["--per-host", str(per_host)]
-    if wayback_max and wayback_max != 3:
-        args += ["--wayback-max", str(wayback_max)]
     if host_delay is not None and host_delay != 1.0:
         args += ["--per-host-delay", str(host_delay)]
     if max_rate is not None and max_rate != 20:
         args += ["--max-rate", str(max_rate)]
+    if read_timeout is not None:
+        args += ["--read-timeout", str(read_timeout)]
     if not curl_cffi:
         args += ["--no-curl-cffi"]
-    if chunk_size and chunk_size != 2000:
-        args += ["--chunk-size", str(chunk_size)]
     if retry_failed:
         args += ["--retry-failed"]
     run_stage("fetch.py", *args)
+
+
+def archive(data_dir, limit, workers=None, archive_rate=None,
+            archive_api=None, retry_deferred=False):
+    """Wayback pass (v4 Stage 2) over the live pass's deferred rows.
+
+    A separate, long job: run it after (or during) the live pass,
+    from any machine. With no --retry-deferred it works over
+    wayback-retry rows only; with it, archive-deferred rows from an
+    earlier archive pass are re-attempted too.
+    """
+    args = ["--links", data_dir / "links.csv", "--out", data_dir / "texts.csv"]
+    if limit:
+        args += ["--limit", limit]
+    if workers:
+        args += ["--archive-workers", str(workers)]
+    if archive_rate is not None:
+        args += ["--archive-rate", str(archive_rate)]
+    if archive_api:
+        args += ["--archive-api", archive_api]
+    if retry_deferred:
+        args += ["--retry-deferred"]
+    run_stage("archive.py", *args)
 
 
 def extract(data_dir, limit):
@@ -193,14 +244,21 @@ def dedupe(data_dir):
 
 
 def full(data_dir, since, until, backfill, limit, sources=None,
-         retry_failed=False, workers=1, per_host=2, wayback_max=3,
-         host_delay=1.0, max_rate=20, curl_cffi=True, chunk_size=2000):
+         retry_failed=False, workers=20, per_host=2, wayback_max=3,
+         host_delay=1.0, max_rate=20, curl_cffi=True, chunk_size=2000,
+         read_timeout=None):
+    # v4: discover, prune, then the live-only fetch, then extract and
+    # dedupe. The archive pass is NOT in `full`: it is a separate,
+    # weeks-long job over the deferred rows (run.py archive), run after
+    # or during the live pass from whatever egress can reach archive.org.
     stages = [
         ("discover", lambda: discover(data_dir, since, until, backfill, limit,
                                       sources, retry_failed)),
+        ("prune", lambda: prune(data_dir)),
         ("fetch", lambda: fetch(data_dir, limit, workers, per_host,
                                 wayback_max, host_delay, max_rate,
-                                curl_cffi, chunk_size, retry_failed)),
+                                curl_cffi, chunk_size, retry_failed,
+                                read_timeout)),
         ("extract", lambda: extract(data_dir, limit)),
         ("dedupe", lambda: dedupe(data_dir)),
     ]
@@ -236,20 +294,23 @@ def main():
                              "in failed_windows.csv instead of discovering; "
                              "fetch stage: re-attempt only rows previously "
                              "recorded FAILED (or wayback-retry) instead of "
-                             "resuming past them")
+                             "resuming past them; archive stage: accepted "
+                             "as an alias for --retry-deferred")
+    common.add_argument("--retry-deferred", action="store_true",
+                        help="archive stage only: also re-attempt rows "
+                             "deferred by an earlier archive pass "
+                             "(archive-deferred), not just live-deferred "
+                             "rows")
     common.add_argument("--dry-run", action="store_true",
                         help="bq stage only: report estimated BigQuery bytes "
                              "without executing anything")
-    common.add_argument("--workers", type=int, default=1,
+    common.add_argument("--workers", type=int, default=20,
                         help="fetch stage only: fetch N URLs concurrently "
-                             "(default 1, sequential; 8-16 is a good range)")
+                             "(default 20, the measured knee; 1 is "
+                             "sequential)")
     common.add_argument("--per-host", type=int, default=2,
                         help="fetch stage only: max concurrent requests to "
                              "one website (default 2; only with --workers)")
-    common.add_argument("--wayback-max", type=int, default=3,
-                        help="fetch stage only: max concurrent requests to "
-                             "web.archive.org (default 3; only with "
-                             "--workers)")
     common.add_argument("--per-host-delay", type=float, default=1.0,
                         help="fetch stage only: minimum seconds between two "
                              "requests to the same website (default 1.0; "
@@ -258,6 +319,19 @@ def main():
                         help="fetch stage only: max requests per second "
                              "across all websites (default 20; 0 for no "
                              "cap; only with --workers)")
+    common.add_argument("--read-timeout", type=float, default=None,
+                        help="fetch stage only: live read timeout in "
+                             "seconds (default 8)")
+    common.add_argument("--archive-workers", type=int, default=None,
+                        help="archive stage only: concurrent archive "
+                             "lookups/fetches (default 4)")
+    common.add_argument("--archive-rate", type=float, default=None,
+                        help="archive stage only: max archive.org "
+                             "requests/second (default 2; 0 for no cap)")
+    common.add_argument("--archive-api", choices=["cdx", "available"],
+                        default=None,
+                        help="archive stage only: snapshot-availability "
+                             "API (default cdx)")
     common.add_argument("--curl-cffi", action=argparse.BooleanOptionalAction,
                         default=True,
                         help="fetch stage only: try curl_cffi "
@@ -265,9 +339,11 @@ def main():
                              "httpx 403/429 (default on; --no-curl-cffi "
                              "disables it)")
     common.add_argument("--chunk-size", type=int, default=2000,
-                        help="fetch stage only: URLs submitted per chunk "
-                             "(default 2000; a slow URL stalls only its "
-                             "own chunk)")
+                        help="accepted for call compatibility with v3; "
+                             "ignored (v4 has no chunked writes)")
+    common.add_argument("--wayback-max", type=int, default=3,
+                        help="accepted for call compatibility with v3; "
+                             "ignored (no Wayback traffic in the live pass)")
     common.add_argument("--slim", action="store_true",
                         help="bq stage only: read only DATE + URL from BigQuery "
                              "and filter on the URL slug alone (far fewer bytes "
@@ -284,14 +360,19 @@ def main():
                    help="harvest links from GDELT bulk GKG files (2015+)")
     sub.add_parser("bq", parents=[common],
                    help="harvest links from GDELT GKG in BigQuery")
+    sub.add_parser("prune", parents=[common],
+                   help="prune links.csv with the S1 URL-only rules")
     sub.add_parser("fetch", parents=[common],
-                   help="download article text for each link")
+                   help="download article text for each link (live only)")
+    sub.add_parser("archive", parents=[common],
+                   help="recover deferred URLs from the Wayback Machine")
     sub.add_parser("extract", parents=[common],
                    help="run the LLM extraction over article texts")
     sub.add_parser("dedupe", parents=[common],
                    help="merge duplicate advisories")
     sub.add_parser("full", parents=[common],
-                   help="run discover, fetch, extract, dedupe in order")
+                   help="run discover, prune, fetch, extract, dedupe in "
+                        "order (no archive pass; run it separately)")
     args = parser.parse_args()
 
     if args.backfill and args.backfill[0] > args.backfill[1]:
@@ -306,11 +387,16 @@ def main():
                            args.backfill, args.limit),
         "bq": lambda: bq(data_dir, args.since, args.until,
                          args.backfill, args.limit, args.dry_run, args.slim),
+        "prune": lambda: prune(data_dir),
         "fetch": lambda: fetch(data_dir, args.limit, args.workers,
                                args.per_host, args.wayback_max,
                                args.per_host_delay, args.max_rate,
                                args.curl_cffi, args.chunk_size,
-                               args.retry_failed),
+                               args.retry_failed, args.read_timeout),
+        "archive": lambda: archive(data_dir, args.limit,
+                                   args.archive_workers, args.archive_rate,
+                                   args.archive_api,
+                                   args.retry_deferred or args.retry_failed),
         "extract": lambda: extract(data_dir, args.limit),
         "dedupe": lambda: dedupe(data_dir),
         "full": lambda: full(data_dir, args.since, args.until,
@@ -318,7 +404,8 @@ def main():
                              args.retry_failed, args.workers,
                              args.per_host, args.wayback_max,
                              args.per_host_delay, args.max_rate,
-                             args.curl_cffi, args.chunk_size),
+                             args.curl_cffi, args.chunk_size,
+                             args.read_timeout),
     }
     stages[args.stage]()
 

@@ -150,9 +150,18 @@ def build_sql(chunk_start, chunk_end, us_only=True, slim=False):
     slug_clause = " OR ".join(
         f"REGEXP_CONTAINS(LOWER(DocumentIdentifier), "
         f"r'://[^/]*/.*{w}')" for w in ("water", "drink", "boil"))
+    # H1 (v4): the "waters" exclusion is whole-word, with a "watershed"
+    # exception. The old substring form (LIKE '%waters%') killed real
+    # advisories whose slug contains "watershed" -- two passed "Atlanta
+    # watershed" URLs on the 2024-06-03 one-day set. The word boundary
+    # alone already keeps them; the watershed exception is belt-and-
+    # braces. Measured on the slim set, whole-word "waters" drops 81
+    # URLs with 0 valuable lost (vs 108 URLs / 2 passed lost as a
+    # substring).
     waters_exclusion = (
-        " AND NOT (LOWER(DocumentIdentifier) LIKE '%waters%'"
-        " AND LOWER(DocumentIdentifier) NOT LIKE '%boil%')")
+        " AND NOT (REGEXP_CONTAINS(LOWER(DocumentIdentifier), r'waters\\b')"
+        " AND LOWER(DocumentIdentifier) NOT LIKE '%boil%'"
+        " AND LOWER(DocumentIdentifier) NOT LIKE '%watershed%')")
     if slim:
         # Slim mode: read only the two narrow columns (DATE + URL) and
         # filter on the URL slug alone. No themes, no locations, so the

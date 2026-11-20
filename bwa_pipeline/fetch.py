@@ -1,28 +1,44 @@
-"""Download article text for candidate URLs.
+"""Download article text for candidate URLs (v4: live-only).
 
 Reads links.csv, fetches each URL with an identified user-agent, checks
 robots.txt first, and extracts the article text with trafilatura
 (readability-lxml as fallback). Pages too short to be real articles are
-marked Loaded=False. When the live fetch fails, the Wayback Machine's
-archived copy is tried before giving up.
+marked Loaded=False.
+
+v4 is the live pass ONLY. A live failure is recorded in SQLite as
+wayback-retry (deferred) and the run moves on: this module never calls
+the Wayback Machine, never waits on it, and never knows it exists. The
+separate archive.py command works over the deferred rows later, from
+any machine, with its own circuit breaker. That decoupling is the fix
+for the v3 stall (21 rows in 107 min, 2026-11-19): a blocked CDX can no
+longer serialize the live run, because the live worker cannot call it.
 
 Pass --workers N to fetch N URLs concurrently (threads; the work is
-network-bound, so threads are the right tool). Output order matches the
-input order, and re-runs still resume past URLs already in the output
-file, so a parallel run is interchangeable with a sequential one.
+network-bound, so threads are the right tool -- asyncio measured no
+better). Default 20 workers, the measured knee. Results are recorded
+in SQLite (URL-keyed) as they complete, out of order, and texts.csv is
+rendered from the database in input order at the end, so the CSV
+contract is kept without in-order chunk writes amplifying a stall.
+Re-running resumes past finished URLs by URL key; nothing is
+re-fetched. A worker never dies on one URL: per-URL failures become
+rows, and a bad SQLite write is logged, not fatal.
 
-v3: two-tier HTTP (httpx, then curl_cffi impersonate="chrome" for hosts
-that 403/429 httpx), a per-host AIMD/AutoThrottle controller with
-upward-only jitter, host parking (blocked hosts go Wayback-only and are
-recorded in parked_hosts.json), challenge-page detection, a per-URL
-attempt budget, chunked submission with in-order writes, and a SQLite
-run state (state.py) plus a JSON run manifest next to the output file.
-No proxy tier: parked hosts go Wayback-only, never through a proxy.
+v4 kept from v3: two-tier HTTP (httpx, then curl_cffi
+impersonate="chrome" for hosts that 403/429 httpx), a per-host
+AIMD/AutoThrottle controller with upward-only jitter, host parking
+(blocked hosts skip the live attempt and go straight to the deferred
+queue), challenge-page detection, a shared httpx client with
+connection pooling, and a JSON run manifest next to the output file.
+No proxy tier: parked hosts go to the deferred queue, never through a
+proxy.
 
-No Common Crawl index-lookup path here: CC-NEWS has no usable URL index
-(the community index was never verified), so searching it means streaming
-whole monthly WARC files -- far too heavy for a per-article fallback.
-Wayback CDX covers the same recovery job at a fraction of the cost.
+v4 removed vs v3: the inline Wayback fallback (moved to archive.py),
+the per-URL live retry loop (one live attempt; retries belong to a
+separate --retry-failed pass), chunked in-order writes (replaced by
+SQLite-then-export), and the texts.csv-scan resume fallback (the state
+DB is the resume index; at backfill scale the scan is O(gigabytes)).
+Read timeout is 8s (down from 15s): timeouts consumed ~55% of
+worker-seconds at 15s, and cutting to 8s is worth ~20-25% throughput.
 """
 
 import argparse
@@ -61,21 +77,16 @@ except ImportError:
     from state import RunState
 
 TEXT_COLUMNS = ["Link", "Loaded", "Text", "publish_date", "source"]
-WAYBACK_CDX = "https://web.archive.org/cdx/search/cdx"
-WAYBACK_HOST = "web.archive.org"
 
-# Per-phase timeouts for live fetches (v3 per-URL budget). Honest
-# worst case per URL, excluding time queued behind a busy host or a
-# host-wide not_before pause: 3 live attempts x (5s connect + 15s
-# read) = 60s, + up to 4.5s jittered backoff, + at most 30s of
-# Retry-After sleep in total across the live and CDX attempts (one
-# shared budget per URL; past it the URL is deferred, not slept on),
-# + one 20s curl_cffi attempt, + 2 CDX attempts at 10s with up to 3s
-# backoff, + a 15s snapshot -- about 160s. Anything over budget is
-# deferred to a --retry-failed pass instead of retried in place.
+# Per-phase timeouts for live fetches (v4 per-URL budget). Honest
+# worst case per URL, excluding time queued behind a busy host: one
+# live attempt (5s connect + 8s read) + at most one curl_cffi attempt
+# at the same timeouts + up to 4.5s jittered backoff -- about 35s.
+# Anything over budget is deferred to the archive queue or a
+# --retry-failed pass instead of retried in place.
 _LIVE_TIMEOUT = httpx.Timeout(
     connect=getattr(config, "FETCH_CONNECT_TIMEOUT", 5),
-    read=getattr(config, "FETCH_READ_TIMEOUT", 15),
+    read=getattr(config, "FETCH_READ_TIMEOUT", 8),
     write=getattr(config, "FETCH_WRITE_TIMEOUT", 10),
     pool=getattr(config, "FETCH_POOL_TIMEOUT", 5))
 
@@ -137,12 +148,12 @@ def _jitter_up(seconds):
 
 
 # Stop flag for prompt Ctrl+C exit. Set by fetch_all's
-# KeyboardInterrupt handler; every pace / backoff / Retry-After sleep
-# in a worker thread waits on it instead of time.sleep, so a worker
-# wakes the moment the run is interrupted instead of sleeping out a
-# 30s Retry-After or a 60s host-wide pause while holding its slot.
-# (SIGINT itself only ever lands in the main thread, so worker
-# threads cannot rely on KeyboardInterrupt to wake them.)
+# KeyboardInterrupt handler; every pace / backoff sleep in a worker
+# thread waits on it instead of time.sleep, so a worker wakes the
+# moment the run is interrupted instead of sleeping out a 60s
+# host-wide pause while holding its slot. (SIGINT itself only ever
+# lands in the main thread, so worker threads cannot rely on
+# KeyboardInterrupt to wake them.)
 _STOP = threading.Event()
 
 
@@ -162,39 +173,13 @@ def _sleep(seconds):
         raise _StopRequested("run interrupted")
 
 
-# Total Retry-After sleep allowed per URL, across its live and CDX
-# attempts. One 429 with Retry-After: 30 used to be slept per
-# attempt, so a URL could burn 60s live before Wayback was even
-# tried; the honest worst case was ~212s against the "~90s" claim.
-# Past the budget the URL is deferred (live gives up to Wayback, CDX
-# comes back as wayback-retry) instead of sleeping further.
-_RETRY_AFTER_BUDGET_SECS = 30.0
-
-
-class _RetryAfterBudget:
-    """Per-URL Retry-After sleep budget (seconds remaining)."""
-
-    def __init__(self, total=_RETRY_AFTER_BUDGET_SECS):
-        self.remaining = float(total)
-
-    def take(self, seconds):
-        """Seconds of Retry-After sleep allowed from the budget.
-
-        0 when the header is absent or the budget is spent; otherwise
-        the requested sleep capped at 30s and at what is left.
-        """
-        if seconds is None or self.remaining <= 0:
-            return 0.0
-        allowed = min(max(0.0, float(seconds)), 30.0, self.remaining)
-        self.remaining -= allowed
-        return allowed
-
-
 def _parse_retry_after(value):
     """Retry-After in seconds, from the seconds form or an HTTP-date.
 
     Returns None when the header is absent or unparseable. A date in
-    the past is 0 (retry now); callers cap the sleep at 30s.
+    the past is 0 (retry now). It feeds only the host-wide pause in
+    _HostLimiter: no worker ever sleeps on it per URL, because the
+    live fetch does not retry and does not sleep on Retry-After.
     """
     if value is None:
         return None
@@ -245,7 +230,7 @@ class _RunContext:
         self.robots_cache_path = None
         self.parked = {}       # host -> reason
         self.host_stats = {}   # host -> outcome counters + latencies
-        self.counters = {"cdx_errors": 0, "curl_cffi_ok": 0}
+        self.counters = {"curl_cffi_ok": 0}
 
 
 _CTX = _RunContext()
@@ -309,13 +294,6 @@ def _record_outcome(host, outcome, latency=None, limiter=None,
                           f"{host}: {e}")
     if limiter is not None:
         limiter.record_outcome(host, outcome, latency, retry_after)
-
-
-def _bump_cdx_error(host=WAYBACK_HOST):
-    """Count one retryable CDX failure, globally and for archive.org."""
-    with _CTX.lock:
-        _CTX.counters["cdx_errors"] += 1
-        _host_stat(host)["cdx_errors"] += 1
 
 
 def _is_parked(host):
@@ -534,8 +512,7 @@ def _fetch_live_curl(url, limiter=None, host=None):
     try:
         resp = curl_requests.get(
             url, impersonate="chrome", headers=headers,
-            timeout=(getattr(config, "FETCH_CONNECT_TIMEOUT", 5),
-                     getattr(config, "FETCH_READ_TIMEOUT", 15)),
+            timeout=(_LIVE_TIMEOUT.connect, _LIVE_TIMEOUT.read),
             allow_redirects=True)
     except Exception as e:
         latency = time.monotonic() - t0
@@ -565,22 +542,21 @@ def _fetch_live_curl(url, limiter=None, host=None):
     return resp.text, "live (curl_cffi)"
 
 
-def _fetch_live(url, client=None, limiter=None, host=None, ra_budget=None):
-    """One URL with retries. Returns (html, note) or (None, note).
+def _fetch_live(url, client=None, limiter=None, host=None):
+    """One live attempt for one URL. Returns (html, note) or (None, note).
 
     client: an httpx.Client to reuse (shared across threads; httpx
     clients are thread-safe). If None, a throwaway client is created,
     as before. limiter, if given, receives every classified outcome
     so the per-host AIMD controller can adapt. A host that 403/429s
     httpx, or serves a challenge page, gets one curl_cffi attempt
-    before the URL is given up to Wayback. ra_budget caps the total
-    Retry-After sleep for this URL (shared with the CDX attempt);
-    a fresh 30s budget is used when the caller passes none.
+    before the URL is given up. There is exactly one attempt here,
+    by construction: no retry loop, no Retry-After sleep, no config
+    flag that could restore them. A 429 still pauses the whole host
+    (the limiter honours the site's Retry-After via _record_outcome),
+    but the URL itself is deferred, not retried.
     """
     host = host or urlparse(url).netloc
-    if ra_budget is None:
-        ra_budget = _RetryAfterBudget()
-    waits = [0] + [2 ** i for i in range(config.FETCH_RETRIES)]
     own_client = client is None
     if own_client:
         client = httpx.Client(timeout=_LIVE_TIMEOUT,
@@ -588,76 +564,38 @@ def _fetch_live(url, client=None, limiter=None, host=None, ra_budget=None):
                               headers=_request_headers(),
                               trust_env=False)
     try:
-        for i, wait in enumerate(waits):
-            if wait:
-                _sleep(_jitter_up(wait))
-            t0 = time.monotonic()
-            try:
-                resp = client.get(url)
-            except httpx.HTTPError as e:
-                latency = time.monotonic() - t0
-                _record_outcome(host, "timeout", latency, limiter)
-                if i < len(waits) - 1:
-                    continue
-                return None, f"request failed: {e}"
+        t0 = time.monotonic()
+        try:
+            resp = client.get(url)
+        except httpx.HTTPError as e:
             latency = time.monotonic() - t0
-            if resp.status_code == 429 and i < len(waits) - 1:
-                # The site is explicitly asking us to slow down: honour
-                # its Retry-After (seconds or HTTP-date), capped by the
-                # per-URL budget (30s total across live + CDX), instead
-                # of hammering again after 1s, which just earns another
-                # 429. The limiter also pauses the whole host. Past the
-                # budget the URL is deferred, not slept on.
-                retry_after = _parse_retry_after(
+            _record_outcome(host, "timeout", latency, limiter)
+            return None, f"request failed: {e}"
+        latency = time.monotonic() - t0
+        if resp.status_code != 200:
+            outcome = ("blocked" if resp.status_code == 403
+                       else "rate-limited" if resp.status_code == 429
+                       else "terminal")
+            _record_outcome(
+                host, outcome, latency, limiter,
+                retry_after=_parse_retry_after(
                     resp.headers.get("retry-after"))
-                _record_outcome(host, "rate-limited", latency, limiter,
-                                retry_after=retry_after)
-                if retry_after is not None:
-                    sleep_for = ra_budget.take(retry_after)
-                    if sleep_for > 0:
-                        _sleep(sleep_for)
-                    else:
-                        return None, "HTTP 429 (retry-after budget spent)"
-                continue
-            if resp.status_code >= 500 and i < len(waits) - 1:
-                # A 503 may carry a Retry-After too; honour it like a
-                # 429's, under the same per-URL budget.
-                retry_after = _parse_retry_after(
-                    resp.headers.get("retry-after"))
-                _record_outcome(host, "rate-limited", latency, limiter,
-                                retry_after=retry_after)
-                if retry_after is not None:
-                    sleep_for = ra_budget.take(retry_after)
-                    if sleep_for > 0:
-                        _sleep(sleep_for)
-                    else:
-                        return None, (f"HTTP {resp.status_code} "
-                                      "(retry-after budget spent)")
-                continue
-            if resp.status_code != 200:
-                outcome = ("blocked" if resp.status_code == 403
-                           else "rate-limited" if resp.status_code == 429
-                           else "terminal")
-                _record_outcome(
-                    host, outcome, latency, limiter,
-                    retry_after=_parse_retry_after(
-                        resp.headers.get("retry-after"))
-                    if resp.status_code == 429 else None)
-                if (resp.status_code in (403, 429)
-                        and _curl_may_try(client)
-                        and _curl_client() is not None):
-                    return _fetch_live_curl(url, limiter=limiter, host=host)
-                return None, f"HTTP {resp.status_code}"
-            content_type = resp.headers.get("content-type", "")
-            if "html" not in content_type and content_type:
-                return None, f"not HTML ({content_type})"
-            if _is_challenge(resp.text):
-                _record_outcome(host, "challenge", latency, limiter)
-                if _curl_may_try(client) and _curl_client() is not None:
-                    return _fetch_live_curl(url, limiter=limiter, host=host)
-                return None, "challenge page (blocked)"
-            _record_outcome(host, "ok", latency, limiter)
-            return resp.text, "live"
+                if resp.status_code == 429 else None)
+            if (resp.status_code in (403, 429)
+                    and _curl_may_try(client)
+                    and _curl_client() is not None):
+                return _fetch_live_curl(url, limiter=limiter, host=host)
+            return None, f"HTTP {resp.status_code}"
+        content_type = resp.headers.get("content-type", "")
+        if "html" not in content_type and content_type:
+            return None, f"not HTML ({content_type})"
+        if _is_challenge(resp.text):
+            _record_outcome(host, "challenge", latency, limiter)
+            if _curl_may_try(client) and _curl_client() is not None:
+                return _fetch_live_curl(url, limiter=limiter, host=host)
+            return None, "challenge page (blocked)"
+        _record_outcome(host, "ok", latency, limiter)
+        return resp.text, "live"
     finally:
         if own_client:
             client.close()
@@ -668,134 +606,6 @@ def _fetch_live(url, client=None, limiter=None, host=None, ra_budget=None):
             # clients carry a cookie jar (test stubs do not).
             if isinstance(client, httpx.Client):
                 client.cookies.clear()
-    return None, "request failed"
-
-
-def _fetch_wayback(url, limiter=None, ra_budget=None):
-    """Archived copy via the Wayback CDX API. Returns (html, note).
-
-    The CDX lookup is retried once (2 attempts, 2s backoff): a single
-    slow lookup used to be a permanent FAILED for the URL, and under
-    parallel load several lookups queue on archive.org at once, so a
-    transient 10s timeout is common enough to need a second chance.
-    Only the lookup is retried -- a real "no snapshot" answer is final.
-    Two attempts cover the transient case; a third only lengthens the
-    worst case when archive.org is persistently slow for this IP.
-
-    A CDX failure that is retryable -- a 429/5xx status, a non-JSON
-    body, or an unparseable one (archive.org answers heavy CDX use
-    with a non-JSON error/rate-limit page) -- is NOT a permanent
-    FAILED. It cools archive.org down through the same AIMD controller
-    and comes back as "wayback-retry: ...", so a later --retry-failed
-    pass can re-attempt the URL. The CDX status and the first ~200
-    chars of the body are logged and carried in the note.
-
-    The CDX lookup goes through the archive.org AIMD slot (concurrency
-    1, rising to 2 on a clean history), not the wider Wayback cap: a
-    lookup queued behind others still counts against this client's 10s
-    timeout, so lookups must not pile up behind each other. The
-    snapshot fetch below uses the wider wayback_slot instead. Every
-    archive.org outcome is recorded, so the AIMD controller learns
-    from CDX and snapshot fetches alike.
-    """
-    if ra_budget is None:
-        ra_budget = _RetryAfterBudget()
-    data = None
-    for attempt, wait in enumerate([0, 2]):
-        if wait:
-            _sleep(_jitter_up(wait))
-        t0 = time.monotonic()
-        try:
-            with limiter.host_slot(WAYBACK_HOST) if limiter else nullcontext():
-                if limiter is not None:
-                    limiter.wait_turn(WAYBACK_HOST)
-                resp = httpx.get(WAYBACK_CDX, params={
-                    "url": url, "output": "json",
-                    "filter": "statuscode:200", "limit": 1,
-                }, timeout=getattr(config, "CDX_TIMEOUT", 10),
-                    follow_redirects=True, trust_env=False,
-                    headers=_request_headers())
-        except httpx.HTTPError as e:
-            _bump_cdx_error()
-            _record_outcome(WAYBACK_HOST, "timeout",
-                            time.monotonic() - t0, limiter)
-            if attempt == 1:
-                return None, f"wayback-retry: CDX lookup failed: {e}"
-            continue
-        latency = time.monotonic() - t0
-        status = resp.status_code
-        ctype = resp.headers.get("content-type", "")
-        if status == 429 or status >= 500:
-            retry_after = _parse_retry_after(resp.headers.get("retry-after"))
-            _record_outcome(WAYBACK_HOST, "rate-limited", latency, limiter,
-                            retry_after=retry_after)
-            _bump_cdx_error()
-            snippet = _snippet(resp.text)
-            print(f"  CDX lookup failed for {url}: HTTP {status} {snippet}")
-            if attempt == 1:
-                return None, f"wayback-retry: CDX HTTP {status} {snippet}"
-            if retry_after is not None:
-                sleep_for = ra_budget.take(retry_after)
-                if sleep_for > 0:
-                    _sleep(sleep_for)
-                else:
-                    return None, (f"wayback-retry: CDX HTTP {status} "
-                                  f"(retry-after budget spent) {snippet}")
-            continue
-        if "json" not in ctype:
-            # A 200 carrying an HTML error/rate-limit page: archive.org
-            # telling us to back off, not a usable answer.
-            _record_outcome(WAYBACK_HOST, "rate-limited", latency, limiter)
-            _bump_cdx_error()
-            snippet = _snippet(resp.text)
-            print(f"  CDX lookup failed for {url}: non-JSON ({ctype}) "
-                  f"{snippet}")
-            if attempt == 1:
-                return None, (f"wayback-retry: CDX non-JSON ({ctype}) "
-                              f"{snippet}")
-            continue
-        try:
-            data = resp.json()
-            if isinstance(data, dict):
-                raise ValueError(f"CDX error object: {str(data)[:200]}")
-        except Exception as e:
-            _record_outcome(WAYBACK_HOST, "rate-limited", latency, limiter)
-            _bump_cdx_error()
-            print(f"  CDX lookup failed for {url}: invalid JSON: {e}")
-            if attempt == 1:
-                return None, f"wayback-retry: CDX invalid JSON: {e}"
-            continue
-        _record_outcome(WAYBACK_HOST, "ok", latency, limiter)
-        break
-    # First row is the header; rows after it are snapshots.
-    if not isinstance(data, list) or len(data) < 2:
-        return None, "no wayback snapshot"
-    row = data[1]
-    timestamp, original = row[1], row[2]
-    snapshot = f"https://web.archive.org/web/{timestamp}id_/{original}"
-    t0 = time.monotonic()
-    try:
-        with limiter.wayback_slot() if limiter else nullcontext():
-            resp = httpx.get(snapshot,
-                             timeout=getattr(config, "SNAPSHOT_TIMEOUT", 15),
-                             follow_redirects=True, trust_env=False,
-                             headers=_request_headers())
-    except httpx.HTTPError as e:
-        _record_outcome(WAYBACK_HOST, "timeout",
-                        time.monotonic() - t0, limiter)
-        return None, f"wayback fetch failed: {e}"
-    latency = time.monotonic() - t0
-    if resp.status_code == 429:
-        _record_outcome(WAYBACK_HOST, "rate-limited", latency, limiter,
-                        retry_after=_parse_retry_after(
-                            resp.headers.get("retry-after")))
-        return None, "wayback HTTP 429"
-    if resp.status_code != 200:
-        return None, f"wayback HTTP {resp.status_code}"
-    if _is_challenge(resp.text):
-        return None, "challenge page (blocked)"
-    _record_outcome(WAYBACK_HOST, "ok", latency, limiter)
-    return resp.text, "wayback"
 
 
 def classify_note(note):
@@ -855,16 +665,16 @@ def classify_note(note):
     return "other"
 
 class _HostLimiter:
-    """Cap concurrent requests per host, plus a separate cap for Wayback,
-    and adapt each host's delay and concurrency from its outcomes
-    (AIMD + AutoThrottle hybrid).
+    """Cap concurrent requests per host and adapt each host's delay and
+    concurrency from its outcomes (AIMD + AutoThrottle hybrid).
 
     With 50 workers and no per-host cap, one small newspaper could get 50
     simultaneous hits. With this, each host sees at most `per_host`
     concurrent requests (robots check + live fetch), while other hosts
-    proceed in parallel, and web.archive.org gets its own small cap
-    because every failed live fetch falls back to it. A worker never
-    holds two slots at once, so there is no deadlock risk.
+    proceed in parallel. A worker never holds two slots at once, so
+    there is no deadlock risk. (v4: the old separate Wayback cap is
+    gone -- the live pass never touches archive.org, and archive.py
+    has its own limiter and breaker.)
 
     Concurrency caps alone do not limit request RATE: two-at-a-time with
     fast responses still hits one host 10 times in a few seconds, and a
@@ -899,13 +709,15 @@ class _HostLimiter:
             raise ValueError("per_host must be >= 1")
         if wayback < 1:
             raise ValueError("wayback must be >= 1")
+        # wayback is accepted for call compatibility with v3 and
+        # validated, but ignored: v4 has no Wayback slot in the live
+        # limiter (see the class docstring).
         self.per_host = per_host
         self.host_delay = host_delay
         self.global_interval = 1.0 / max_rate if max_rate else 0.0
         self._lock = threading.Lock()
         self._semaphores = {}
         self._sem_target = {}
-        self._wayback_sem = threading.Semaphore(wayback)
         self._next_global = 0.0
         self._next_host = {}
         self._state = {}
@@ -963,9 +775,6 @@ class _HostLimiter:
                 self._semaphores[host] = sem
                 self._sem_target[host] = target
             return sem
-
-    def wayback_slot(self):
-        return self._wayback_sem
 
     def record_outcome(self, host, outcome, latency=None, retry_after=None):
         """Feed one classified outcome into the host's AIMD state."""
@@ -1050,20 +859,18 @@ class _HostLimiter:
 
 
 def fetch_text(url, client=None, limiter=None):
-    """Fetch and extract one article.
+    """Fetch and extract one article, live only.
 
     Returns (loaded, text, note). loaded is False when nothing usable
     came back; note says why. client, if given, is a shared httpx.Client
     reused across calls (and threads). limiter, if given, is a
-    _HostLimiter capping concurrent requests per host (and to Wayback).
-    Text extraction runs outside the host slot, so a slow page parse
-    does not hold up the next request to the same site. A parked host
-    skips the live fetch entirely and goes straight to Wayback.
+    _HostLimiter capping concurrent requests per host. Text extraction
+    runs outside the host slot, so a slow page parse does not hold up
+    the next request to the same site. A parked host skips the live
+    fetch entirely: the caller records the row as wayback-retry
+    (deferred to the archive command), it is never loaded here.
     """
     host = urlparse(url).netloc
-    # One Retry-After budget per URL, shared by the live and Wayback
-    # attempts below (see _RetryAfterBudget).
-    ra_budget = _RetryAfterBudget()
     host_sem = limiter.host_slot(host) if limiter else nullcontext()
     with host_sem:
         # The pace wait happens while holding the host slot, not before
@@ -1075,24 +882,15 @@ def fetch_text(url, client=None, limiter=None):
         if not _allowed(url, limiter=limiter):
             return False, "", "blocked by robots.txt"
         if _is_parked(host):
-            html, note = None, "parked host (wayback only)"
-        else:
-            html, note = _fetch_live(url, client=client, limiter=limiter,
-                                     host=host, ra_budget=ra_budget)
+            return False, "", "parked host (wayback only)"
+        html, note = _fetch_live(url, client=client, limiter=limiter,
+                                 host=host)
     if html:
         text = _extract_text(html, url)
         if len(text) >= config.MIN_TEXT_CHARS:
             return True, text, "live"
-        note = f"live text too short ({len(text)} chars)"
-    print(f"  live fetch failed for {url} ({note}); trying Wayback")
-    html, wb_note = _fetch_wayback(url, limiter=limiter,
-                                          ra_budget=ra_budget)
-    if html:
-        text = _extract_text(html, url)
-        if len(text) >= config.MIN_TEXT_CHARS:
-            return True, text, "wayback"
-        return False, "", f"wayback text too short ({len(text)} chars)"
-    return False, "", wb_note
+        return False, "", f"live text too short ({len(text)} chars)"
+    return False, "", note
 
 
 def _fetch_one(args):
@@ -1254,7 +1052,9 @@ def _write_manifest(manifest_path, params, count, ok, taxonomy, started,
                    "effective_req_per_sec":
                        round(total_requests / elapsed, 2) if elapsed else None},
         "taxonomy": dict(sorted(taxonomy.items())),
-        "cdx_errors": counters.get("cdx_errors", 0),
+        # The live pass makes no CDX calls, so this is always 0; the
+        # archive command reports its own CDX errors in its manifest.
+        "cdx_errors": 0,
         "curl_cffi_ok": counters.get("curl_cffi_ok", 0),
         "parked_hosts": dict(sorted(parked.items())),
         "wayback_only_hosts": sorted(parked),
@@ -1267,48 +1067,81 @@ def _write_manifest(manifest_path, params, count, ok, taxonomy, started,
     return manifest
 
 
-def fetch_all(links_csv, out_csv, limit=None, workers=1, per_host=2,
+def export_texts_csv(state, link_rows, out_csv):
+    """Render texts.csv from the state DB, in input order.
+
+    Every input row appears exactly once: loaded rows carry their
+    extracted text, everything else carries Loaded=False and empty
+    text. Downstream stages key on the URL, so the row set is what
+    matters; the order matches a sequential run. Called at the end of
+    a run and after an interrupt, so a partial run still exports
+    everything it completed.
+    """
+    out = Path(out_csv)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = out.with_name(out.stem + "_export.tmp")
+    with open(tmp_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=TEXT_COLUMNS)
+        writer.writeheader()
+        for url, publish_date, source in link_rows:
+            record = state.get_record(url)
+            loaded = bool(record and record["status"] == "loaded"
+                          and record["text"])
+            writer.writerow({
+                "Link": url,
+                "Loaded": loaded,
+                "Text": record["text"] if loaded else "",
+                "publish_date": publish_date,
+                "source": source,
+            })
+    os.replace(tmp_path, out)
+
+
+def fetch_all(links_csv, out_csv, limit=None, workers=None, per_host=2,
               wayback_max=3, host_delay=1.0, max_rate=20,
               heartbeat_secs=30, curl_cffi=True, chunk_size=2000,
-              retry_failed=False):
-    """Fetch every URL in links.csv, resuming past URLs already in out_csv.
+              retry_failed=False, read_timeout=None):
+    """Fetch every URL in links.csv, live only, resuming by URL key.
 
-    workers=1 is the original sequential loop. With workers=N, N URLs are
-    fetched concurrently and rows are written in input order, so the output
-    file is identical to a sequential run (modulo timing). per_host caps
-    concurrent requests to any one website (default 2); wayback_max caps
-    concurrent requests to web.archive.org (default 3); host_delay is the
-    minimum gap in seconds between two requests to the same website
-    (default 1.0); max_rate caps total requests per second across all
-    websites (default 20, 0 for no cap). The rate floors only matter
-    with workers > 1. heartbeat_secs prints a progress line every N
-    seconds while fetching (default 30, 0 for none), so a long run on
-    slow sites shows it is still working instead of looking stuck.
+    workers defaults to config.DEFAULT_WORKERS (20, the measured knee);
+    per_host caps concurrent requests to any one website (default 2);
+    host_delay is the minimum gap in seconds between two requests to
+    the same website (default 1.0); max_rate caps total requests per
+    second across all websites (default 20, 0 for no cap). The rate
+    floors only matter with workers > 1. heartbeat_secs prints a
+    progress line every N seconds while fetching (default 30, 0 for
+    none), so a long run on slow sites shows it is still working
+    instead of looking stuck. read_timeout overrides the live read
+    timeout in seconds (default 8).
 
-    Deliberate deviation from research section 5.1.7 ("drop input-order
-    output"): texts.csv stays in input order. The v2.7 suite asserts
-    parallel == sequential == rate-limited row-for-row, and a parallel
-    run must stay interchangeable with a sequential one. So URLs are
-    submitted in chunks (default 2000) and each chunk's rows are
-    written in input order; a slow URL stalls only its own chunk, not
-    the whole run. Within a chunk, submission is round-robin by host
-    so one hot host cannot hog the workers.
+    Each completed URL is recorded in the SQLite state DB next to the
+    out file (<stem>_state.db) the moment it resolves -- loaded, or
+    deferred to the archive queue as wayback-retry -- and texts.csv is
+    rendered from the DB in input order when the run ends (or is
+    interrupted). There is no chunked in-order write: one slow URL
+    cannot stall any other row's recording. A re-run skips every URL
+    already in the DB; with --retry-failed, only rows recorded FAILED
+    (or wayback-retry / archive-deferred) are re-attempted, and rows
+    for URLs no longer in links.csv are dropped by the export.
 
-    Resume uses the SQLite state DB next to the out file
-    (<stem>_state.db) -- O(1), no scan of texts.csv. Only when no DB
-    exists (a v2.9 output) does resume fall back to scanning texts.csv.
-    With --retry-failed, only rows recorded FAILED (or wayback-retry)
-    are re-attempted, and the output file is rewritten in input order
-    with the fresh rows; rows for URLs no longer in links.csv are
-    dropped by that rewrite.
+    wayback_max and chunk_size are accepted for call compatibility
+    with v3 and ignored: v4 has no Wayback traffic in the live pass
+    and no chunked writes.
     """
-    global _CTX
+    global _CTX, _LIVE_TIMEOUT
     _CTX = _RunContext()
     _STOP.clear()
     _CTX.curl_cffi = bool(curl_cffi)
-    chunk_size = int(chunk_size) if chunk_size else 2000
-    if chunk_size < 1:
-        chunk_size = 2000
+    if workers is None:
+        workers = getattr(config, "DEFAULT_WORKERS", 20)
+    if workers < 1:
+        raise ValueError("workers must be >= 1")
+    if read_timeout is not None:
+        _LIVE_TIMEOUT = httpx.Timeout(
+            connect=getattr(config, "FETCH_CONNECT_TIMEOUT", 5),
+            read=float(read_timeout),
+            write=getattr(config, "FETCH_WRITE_TIMEOUT", 10),
+            pool=getattr(config, "FETCH_POOL_TIMEOUT", 5))
 
     out = Path(out_csv)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -1317,7 +1150,6 @@ def fetch_all(links_csv, out_csv, limit=None, workers=1, per_host=2,
     parked_path = out.parent / config.PARKED_HOSTS_FILE
     _CTX.robots_cache_path = out.parent / config.ROBOTS_CACHE_FILE
 
-    db_existed = state_path.exists()
     state = RunState(state_path)
     _CTX.state = state
     _load_parked(parked_path, state)
@@ -1330,33 +1162,14 @@ def fetch_all(links_csv, out_csv, limit=None, workers=1, per_host=2,
             link_rows.append((url, link_row.get("publish_date", ""),
                               link_row.get("source", "")))
 
-    if db_existed:
-        done = state.done_urls()
-        failed = set(state.retryable_urls())
-    elif out.exists():
-        existing = pd.read_csv(out, dtype=str).fillna("")
-        done = set((v or "").strip() for v in existing["Link"])
-        failed = {(r.get("Link") or "").strip()
-                  for _, r in existing.iterrows()
-                  if str(r.get("Loaded", "")).strip() != "True"}
-    else:
-        done, failed = set(), set()
-
+    done = state.done_urls()
+    failed = set(state.retryable_urls())
     if retry_failed:
         pending = [row for row in link_rows if row[0] in failed]
     else:
         pending = [row for row in link_rows if row[0] not in done]
     if limit is not None:
         pending = pending[:limit]
-
-    # Rows of the current output file, for the --retry-failed rewrite.
-    existing_rows = {}
-    if retry_failed and out.exists():
-        existing = pd.read_csv(out, dtype=str).fillna("")
-        for _, r in existing.iterrows():
-            url = (r.get("Link") or "").strip()
-            if url:
-                existing_rows[url] = {c: r.get(c, "") for c in TEXT_COLUMNS}
 
     limiter = (_HostLimiter(per_host=per_host, wayback=wayback_max,
                            host_delay=host_delay, max_rate=max_rate)
@@ -1367,17 +1180,13 @@ def fetch_all(links_csv, out_csv, limit=None, workers=1, per_host=2,
                                  record["concurrency"])
 
     limits = httpx.Limits(
-        max_connections=max(1, workers + wayback_max),
+        max_connections=max(1, workers + 10),
         max_keepalive_connections=max(1, workers),
         keepalive_expiry=25)
     count = ok = 0
     taxonomy = {}
     started = time.monotonic()
     stop_hb = threading.Event()
-    new_results = {}
-    buffered = {}
-    next_idx = 0
-    chunk = []
 
     def _tally(loaded, note):
         nonlocal count, ok
@@ -1394,10 +1203,6 @@ def fetch_all(links_csv, out_csv, limit=None, workers=1, per_host=2,
                 shown = ", ".join(parked[:3])
                 extra += (f"; parked: {len(parked)} ({shown}"
                           f"{'...' if len(parked) > 3 else ''})")
-            if limiter is not None:
-                cool = limiter.cooldown_hosts()
-                if cool:
-                    extra += f"; cooldown: {', '.join(cool[:3])}"
             print(f"  ... {count}/{len(pending)} done, "
                   f"{time.monotonic() - started:.0f}s elapsed{extra}")
 
@@ -1405,88 +1210,52 @@ def fetch_all(links_csv, out_csv, limit=None, workers=1, per_host=2,
         threading.Thread(target=_heartbeat, daemon=True).start()
     params = {"links_csv": str(links_csv), "out_csv": str(out_csv),
               "limit": limit, "workers": workers, "per_host": per_host,
-              "wayback_max": wayback_max, "host_delay": host_delay,
-              "max_rate": max_rate, "chunk_size": chunk_size,
+              "host_delay": host_delay, "max_rate": max_rate,
+              "read_timeout": _LIVE_TIMEOUT.read,
               "curl_cffi": bool(curl_cffi), "retry_failed": retry_failed}
     manifest = None
+
+    def record_result(url, loaded, text, note):
+        """Record one resolved URL in the DB, as it completes."""
+        status = ("loaded" if loaded else
+                  "failed" if note.startswith("worker failed")
+                  else "wayback-retry")
+        try:
+            state.record_url(url, status, note, text if loaded else "")
+        except Exception as e:
+            # A bad DB write must never kill the run (this is the
+            # failure shape that stalled the v3-era queue: a worker
+            # dying on a dependency problem). Log it and move on;
+            # the URL is re-attempted on the next run.
+            print(f"  warning: could not record {url}: {e}")
+            return
+        _tally(loaded, note)
+        if loaded:
+            print(f"  [{count}] ok ({note}): {url[:80]}")
+        else:
+            print(f"  [{count}] deferred ({note}): {url[:80]}")
+
     try:
         with httpx.Client(timeout=_LIVE_TIMEOUT, follow_redirects=True,
                           headers=_request_headers(), trust_env=False,
                           limits=limits) as client:
-            new_file = not out.exists() or out.stat().st_size == 0
-            outfile = None if retry_failed else open(
-                out, "a", newline="", encoding="utf-8")
-            writer = None
-            if outfile is not None:
-                writer = csv.DictWriter(outfile, fieldnames=TEXT_COLUMNS)
-                if new_file:
-                    writer.writeheader()
-
-            def write_row(url, publish_date, source, loaded, text, note):
-                writer.writerow({
-                    "Link": url,
-                    "Loaded": loaded,
-                    "Text": text if loaded else "",
-                    "publish_date": publish_date,
-                    "source": source,
-                })
-                outfile.flush()
-                status = ("loaded" if loaded else
-                          "wayback-retry" if note.startswith("wayback-retry")
-                          else "failed")
-                state.record_url(url, status, note)
-                _tally(loaded, note)
-                if loaded:
-                    print(f"  [{count}] ok ({note}): {url[:80]}")
-                else:
-                    print(f"  [{count}] FAILED ({note}): {url[:80]}")
-
-            def handle_result(url, publish_date, source, loaded, text, note):
-                # Append mode writes (and records) the row now; retry
-                # mode only collects it -- the row is written and
-                # recorded during the rewrite below, so an interrupted
-                # retry pass leaves no half-written state behind.
-                if retry_failed:
-                    new_results[url] = (loaded, text, note)
-                else:
-                    write_row(url, publish_date, source, loaded, text, note)
-
-            def flush_prefix():
-                nonlocal next_idx
-                while next_idx in buffered:
-                    url, loaded, text, note = buffered.pop(next_idx)
-                    _, publish_date, source = chunk[next_idx]
-                    handle_result(url, publish_date, source,
-                                  loaded, text, note)
-                    next_idx += 1
-
             pool = (ThreadPoolExecutor(max_workers=workers)
                     if workers > 1 else None)
             try:
-                for start in range(0, len(pending), chunk_size):
-                    chunk = pending[start:start + chunk_size]
-                    buffered = {}
-                    next_idx = 0
-                    if pool is None:
-                        for url, publish_date, source in chunk:
-                            loaded, text, note = fetch_text(url, client=client)
-                            handle_result(url, publish_date, source,
-                                          loaded, text, note)
-                    else:
-                        ordered = _interleave(chunk)
-                        jobs = [(row[0], client, limiter)
-                                for _, row in ordered]
-                        for (url, loaded, text, note), (idx, _) in zip(
-                                pool.map(_fetch_one, jobs), ordered):
-                            buffered[idx] = (url, loaded, text, note)
-                            flush_prefix()
+                if pool is None:
+                    for url, _, _ in pending:
+                        loaded, text, note = fetch_text(url, client=client)
+                        record_result(url, loaded, text, note)
+                else:
+                    ordered = _interleave(pending)
+                    jobs = [(row[0], client, limiter) for _, row in ordered]
+                    for url, loaded, text, note in pool.map(_fetch_one, jobs):
+                        record_result(url, loaded, text, note)
             except KeyboardInterrupt:
-                # Wake every worker out of its pace / backoff /
-                # Retry-After sleep at once, then stop promptly.
+                # Wake every worker out of its pace / backoff sleep at
+                # once, then stop promptly. Completed rows are already
+                # in the DB; the export below saves them.
                 _STOP.set()
-                # Write the consecutive prefix of the current chunk
-                # that already completed, then stop promptly.
-                flush_prefix()
                 if pool is not None:
                     pool.shutdown(wait=False, cancel_futures=True)
                 print("  interrupted -- partial results saved in "
@@ -1495,41 +1264,6 @@ def fetch_all(links_csv, out_csv, limit=None, workers=1, per_host=2,
             else:
                 if pool is not None:
                     pool.shutdown(wait=True)
-            finally:
-                if outfile is not None:
-                    outfile.close()
-
-            if retry_failed:
-                # Rewrite the output file in input order: fresh rows
-                # for the re-attempted URLs, kept rows otherwise.
-                tmp_path = out.with_name(out.stem + "_retry.tmp")
-                with open(tmp_path, "w", newline="",
-                          encoding="utf-8") as f:
-                    writer = csv.DictWriter(f, fieldnames=TEXT_COLUMNS)
-                    writer.writeheader()
-                    for url, publish_date, source in link_rows:
-                        if url in new_results:
-                            loaded, text, note = new_results[url]
-                            writer.writerow({
-                                "Link": url, "Loaded": loaded,
-                                "Text": text if loaded else "",
-                                "publish_date": publish_date,
-                                "source": source})
-                            f.flush()
-                            status = ("loaded" if loaded else
-                                      "wayback-retry"
-                                      if note.startswith("wayback-retry")
-                                      else "failed")
-                            state.record_url(url, status, note)
-                            _tally(loaded, note)
-                            if loaded:
-                                print(f"  [{count}] ok ({note}): {url[:80]}")
-                            else:
-                                print(f"  [{count}] FAILED ({note}): "
-                                      f"{url[:80]}")
-                        elif url in existing_rows:
-                            writer.writerow(existing_rows[url])
-                os.replace(tmp_path, out)
     finally:
         stop_hb.set()
         try:
@@ -1540,6 +1274,10 @@ def fetch_all(links_csv, out_csv, limit=None, workers=1, per_host=2,
             _save_parked(parked_path)
         except Exception as e:
             print(f"  warning: could not save parked hosts: {e}")
+        try:
+            export_texts_csv(state, link_rows, out)
+        except Exception as e:
+            print(f"  warning: could not export {out_csv}: {e}")
         try:
             manifest = _write_manifest(manifest_path, params, count, ok,
                                        taxonomy, started, limiter)
@@ -1557,21 +1295,17 @@ def fetch_all(links_csv, out_csv, limit=None, workers=1, per_host=2,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Fetch article text for discovered links.")
+        description="Fetch article text for discovered links (live only).")
     parser.add_argument("--links", default=str(config.DATA_DIR / "links.csv"))
     parser.add_argument("--out", default=str(config.DATA_DIR / "texts.csv"))
     parser.add_argument("--limit", type=int, default=None,
                         help="cap the number of links fetched (smoke tests)")
-    parser.add_argument("--workers", type=int, default=1,
-                        help="fetch N URLs concurrently (default 1, "
-                             "sequential; 8-16 is a good range for a big "
-                             "harvest -- output order is unchanged)")
+    parser.add_argument("--workers", type=int, default=None,
+                        help="fetch N URLs concurrently (default 20, the "
+                             "measured knee; 1 is sequential)")
     parser.add_argument("--per-host", type=int, default=2,
                         help="max concurrent requests to one website "
                              "(default 2; only matters with --workers > 1)")
-    parser.add_argument("--wayback-max", type=int, default=3,
-                        help="max concurrent requests to web.archive.org "
-                             "(default 3; only matters with --workers > 1)")
     parser.add_argument("--per-host-delay", type=float, default=1.0,
                         help="minimum seconds between two requests to the "
                              "same website (default 1.0; 0 for none; only "
@@ -1580,30 +1314,29 @@ def main():
                         help="max requests per second across all websites "
                              "(default 20; 0 for no cap; only matters with "
                              "--workers > 1)")
+    parser.add_argument("--read-timeout", type=float, default=None,
+                        help="live read timeout in seconds (default 8; "
+                             "timeouts consumed ~55%% of worker-seconds "
+                             "at 15s)")
     parser.add_argument("--curl-cffi", action=argparse.BooleanOptionalAction,
                         default=True,
                         help="try curl_cffi impersonate=chrome as a second "
                              "attempt after httpx 403/429 (default on; "
                              "--no-curl-cffi disables it)")
-    parser.add_argument("--chunk-size", type=int, default=2000,
-                        help="URLs submitted per chunk (default 2000; a "
-                             "slow URL stalls only its own chunk)")
     parser.add_argument("--retry-failed", action="store_true",
                         help="re-attempt only rows previously recorded "
-                             "FAILED (or wayback-retry) instead of "
-                             "resuming past them")
+                             "FAILED (or wayback-retry / archive-deferred) "
+                             "instead of resuming past them")
     args = parser.parse_args()
+    if args.workers is not None and args.workers < 1:
+        parser.error("--workers must be >= 1")
     if args.per_host < 1:
         parser.error("--per-host must be >= 1")
-    if args.wayback_max < 1:
-        parser.error("--wayback-max must be >= 1")
-    if args.chunk_size < 1:
-        parser.error("--chunk-size must be >= 1")
     fetch_all(args.links, args.out, limit=args.limit, workers=args.workers,
-              per_host=args.per_host, wayback_max=args.wayback_max,
-              host_delay=args.per_host_delay, max_rate=args.max_rate,
-              curl_cffi=args.curl_cffi, chunk_size=args.chunk_size,
-              retry_failed=args.retry_failed)
+              per_host=args.per_host, host_delay=args.per_host_delay,
+              max_rate=args.max_rate, curl_cffi=args.curl_cffi,
+              retry_failed=args.retry_failed,
+              read_timeout=args.read_timeout)
 
 
 if __name__ == "__main__":

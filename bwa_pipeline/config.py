@@ -36,31 +36,54 @@ MEDIACLOUD_API_KEY = os.getenv("MEDIACLOUD_API_KEY")
 BQ_KEY_FILE = os.getenv("BQ_KEY_FILE")
 BROWSER_HEADERS_FILE = os.getenv("BROWSER_HEADERS_FILE")
 
-# Fetching: identify the bot, retry briefly, drop junk pages.
+# Fetching: identify the bot, drop junk pages.
 USER_AGENT = "BoilWaterAdvisoryBot/1.0 (academic research project)"
 FETCH_TIMEOUT = 20
-# Live attempts per URL = FETCH_RETRIES + 1 = 3 (v3 per-URL budget).
-FETCH_RETRIES = 2
+# v4 makes exactly one live attempt per URL, by construction: there
+# is no retry loop in fetch.py and no setting that could restore one.
+# A second live attempt on a 404/timeout has ~no chance and costs a
+# full latency; retries belong to a separate --retry-failed pass, not
+# the hot path. The curl_cffi second attempt after an httpx 403/429
+# still applies.
 MIN_TEXT_CHARS = 300
 
-# v3 fetcher defaults.
+# v4 fetcher defaults.
 MAX_RATE = 20              # global requests/second cap (0 for no cap)
 CURL_CFFI = True           # try curl_cffi impersonate="chrome" as a
                            # second attempt after an httpx 403/429
-CHUNK_SIZE = 2000          # URLs submitted per chunk; rows are written
-                           # in input order within each chunk, so one
-                           # slow URL stalls only its chunk
+DEFAULT_WORKERS = 20       # thread-pool size for the live pass (the
+                           # measured knee; re-probe on the run machine)
 FETCH_CONNECT_TIMEOUT = 5  # per-phase timeouts for live fetches (s)
-FETCH_READ_TIMEOUT = 15
+FETCH_READ_TIMEOUT = 8     # v4: 8s, down from 15s -- timeouts consumed
+                           # ~55% of worker-seconds at 15s, and cutting
+                           # to 8s is worth ~20-25% throughput
 FETCH_WRITE_TIMEOUT = 10
 FETCH_POOL_TIMEOUT = 5
-CDX_TIMEOUT = 10           # seconds per Wayback CDX attempt (2 attempts)
-SNAPSHOT_TIMEOUT = 15      # seconds for a Wayback snapshot fetch
 ROBOTS_CACHE_TTL_HOURS = 24
 STATE_DB_SUFFIX = "_state.db"       # appended to the out-file stem
 MANIFEST_SUFFIX = "_manifest.json"  # appended to the out-file stem
 PARKED_HOSTS_FILE = "parked_hosts.json"  # beside the out file
 ROBOTS_CACHE_FILE = "robots_cache.json"  # beside the state DB
+
+# Archive command (archive.py) defaults. The archive pass is a
+# separate command over the rows the live pass deferred; it never
+# shares a limiter with the live pass.
+CDX_TIMEOUT = 10           # seconds per Wayback CDX attempt
+SNAPSHOT_TIMEOUT = 15      # seconds for a Wayback snapshot fetch
+ARCHIVE_WORKERS = 4        # concurrent archive lookups/fetches
+ARCHIVE_RATE = 2           # max archive.org requests/second (0: no cap)
+ARCHIVE_API = "cdx"        # snapshot-availability API: "cdx" or
+                           # "available" (wayback/available endpoint)
+# Circuit breaker (archive only): trip after this many consecutive
+# CDX/snapshot failures, or an error rate above BREAKER_MAX_ERROR_RATE
+# over the last BREAKER_WINDOW lookups. While open, zero archive
+# requests are sent; the remaining queue is deferred and the command
+# exits 0. Cooldown doubles after each failed half-open probe, capped.
+BREAKER_MAX_CONSECUTIVE = 10
+BREAKER_WINDOW = 50
+BREAKER_MAX_ERROR_RATE = 0.5
+BREAKER_COOLDOWN_SECS = 600     # 10 minutes
+BREAKER_MAX_COOLDOWN_SECS = 7200  # 2 hours
 
 # Discovery queries. The same list feeds every search-based source so
 # results are comparable across them.
