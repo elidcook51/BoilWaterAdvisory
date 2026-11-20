@@ -6,3 +6,4 @@ bwa_crawler
 *.json
 *.done
 *.db
+*.md
